@@ -1,8 +1,8 @@
 """
 What this service has to get right, in one file.
 
-Scoped deliberately. The two test modules that used to live here were written
-against a different application — a tenant/gym schema, `DATA UPDATE USERINFO`
+Scraped deliberately. The two test modules that used to live here were written
+against a different legacy schema, `DATA UPDATE USERINFO`
 replies, a JSON root route — and asserted behaviour this service has never
 had. They could not pass, which is presumably why the pytest step in CI was
 commented out. A suite that cannot pass is worse than none: it reports green

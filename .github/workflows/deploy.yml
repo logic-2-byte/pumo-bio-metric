@@ -26,14 +26,11 @@ jobs:
         with:
           context: .
           push: true
-          tags: logic2byte/gym-biometric-server:latest
+          tags: logic2byte/pumo-biometric-server:latest
           # No build-args.
           #
-          # This step used to pass DB_HOST/DB_USER/DB_PASSWORD as build args,
-          # which bakes them into image layers — anyone who can pull the image
-          # can read them back out with `docker history`, and they are pushed
-          # to Docker Hub on every release. Configuration reaches the container
-          # at RUN time, from the .env the deploy job writes.
+          # Configuration reaches the container at RUN time, from the .env
+          # the deploy job writes.
 
 
   deploy:
@@ -51,38 +48,43 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           source: "docker-compose.prod.yml"
-          target: "~/gym-biometric-server/"
+          target: "~/pumo-biometric-server/"
 
       - name: Deploy to VM
         uses: appleboy/ssh-action@v1
         env:
-          ENV_CONTENT: ${{ vars.ENV }}
+          ENV_CONTENT: ${{ secrets.ENV || vars.ENV }}
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           envs: ENV_CONTENT
           script: |
-            mkdir -p ~/gym-biometric-server
-            cd ~/gym-biometric-server
+            mkdir -p ~/pumo-biometric-server
+            cd ~/pumo-biometric-server
 
             echo "Updating docker-compose.yml..."
-            if [ -f "docker-compose.yml" ] && [ ! -L "docker-compose.yml" ]; then
-              mv docker-compose.yml docker-compose.yml.bak || true
+            if [ -f "docker-compose.prod.yml" ]; then
+              mv docker-compose.prod.yml docker-compose.yml
             fi
-            mv docker-compose.prod.yml docker-compose.yml
 
-            echo "Creating .env file from GitHub Environment variables..."
+            echo "Creating .env file..."
             echo "$ENV_CONTENT" > .env
             chmod 600 .env
 
-            echo "Stopping and removing old containers..."
-            docker stop gym-biometric-server || true
-            docker rm gym-biometric-server || true
-            docker-compose down || true
-            
-            echo "Pulling latest Docker images..."
-            docker-compose pull
-            
+            # Detect whether VM uses modern 'docker compose' or legacy 'docker-compose'
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "Error: Neither 'docker compose' nor 'docker-compose' found on the host."
+              exit 1
+            fi
+
+            echo "Pulling latest Docker image..."
+            $DC pull
+
             echo "Starting services..."
-            docker-compose up -d --force-recreate
+            $DC up -d --force-recreate
+

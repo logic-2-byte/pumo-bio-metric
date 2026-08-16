@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 # Load database settings from .env file
 load_dotenv()
 
-DB_NAME = os.getenv("DB_NAME", "gym")
+DB_NAME = os.getenv("DB_NAME", "pumo")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "root")
 DB_HOST = os.getenv("DB_HOST", "localhost")

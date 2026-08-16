@@ -19,8 +19,8 @@
 
 services:
   app:
-    image: logic2byte/gym-biometric-server:latest
-    container_name: gym-biometric-server
+    image: logic2byte/pumo-biometric-server:latest
+    container_name: pumo-biometric-server
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -45,10 +45,3 @@ services:
         max-size: "10m"
         max-file: "5"
 
-    networks:
-      - gym-network
-
-networks:
-  gym-network:
-    external: true
-    name: logic2bytes_gym-network
