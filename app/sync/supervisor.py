@@ -1,72 +1,50 @@
 """
-Keeps one worker running per registered reader.
+The background half of the service: keep the spool draining, and report state.
 
-WHERE THE DEVICE LIST COMES FROM, and why it is not a config file: the console
-is where an operator registers a reader, gives it a name and an address, and
-says which branch it belongs to. Reading the list from `biometric_devices`
-means adding a reader there is all it takes — no config edit, no restart, no
-second place to keep in step. A device registered at 10:00 is being polled by
-about 10:02.
+WHAT THIS USED TO BE. One thread per registered reader, each dialling the
+device on TCP 4370 (`pyzk`, with an ICMP ping in front of every connect),
+re-reading its whole memory on a schedule, and stamping a heartbeat down the
+same socket. All of it is gone, along with `device_worker.py`, because the
+premise was wrong: in production a reader is on a branch LAN behind a router
+this service cannot route to, so every one of those connects failed on a
+device that was working perfectly — while costing a probe per reader per few
+seconds to find that out.
 
-There is no env-configured device and no local device list. A company runs one
-or two readers per branch, so which readers exist is a property of the company,
-not of the host this process happens to run on — and two places to define a
-reader is one place to define it wrongly.
+Readers push to us instead. Capture is `app.router.iclock` answering requests
+the device makes, and liveness is `app.sync.liveness` writing down that they
+arrived. Neither needs supervising, which is why almost nothing is left here.
 
-That means an empty `biometric_devices` table means nothing is polled, which is
-correct: a reader nobody has registered is a reader nobody has told us the
-serial of, and guessing it produces punches filed against an unknown device.
+WHAT IS LEFT, AND WHY IT IS STILL NEEDED. A pushed punch arrives exactly once.
+If the LMS database is unreachable at that moment, `push_ingest` holds it on
+disk rather than dropping it — the reader will never offer it again. Something
+then has to notice the database is back and flush that file, and it cannot be
+the next push: a branch where nobody punches after 18:00 would leave the
+evening's held punches sitting there until somebody arrives the next morning.
+So one timer, doing one thing.
 """
 from __future__ import annotations
 
 import threading
-from datetime import datetime
 from typing import Any
 
 from app.sync.config import SyncConfig
 from app.sync.config import config as default_config
-from app.sync.device_worker import DeviceWorker, _log
 from app.sync.lms_db import LmsDatabase, LmsUnavailableError
-from app.sync.models import Punch
 from app.sync.spool import PunchSpool
 
 
-def _broadcast_to_dashboard(punch: Punch) -> None:
-    """
-    Mirror a punch onto this service's own live dashboard.
-
-    Imported inside the function on purpose. `app.router.iclock` pulls in
-    FastAPI and the SSE machinery, and the sync package has to remain usable
-    from a plain script with no web server running — `python -m app.sync.run`
-    is a supported way to deploy this bridge on a branch box that has no reason
-    to serve a dashboard at all.
-    """
-    from app.router.iclock import broadcast_punch
-
-    broadcast_punch({
-        "id": f"{punch.device_serial}-{punch.device_user_id}-{punch.device_time:%Y%m%d%H%M%S}",
-        "sn": punch.device_serial,
-        "userId": punch.device_user_id,
-        "userName": punch.device_user_name or f"User {punch.device_user_id}",
-        "timestamp": punch.device_time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status": str(punch.punch_state),
-        "verifyType": str(punch.verify_mode if punch.verify_mode is not None else 1),
-        "workCode": punch.work_code or "0",
-        "raw": punch.raw_payload,
-        "receivedAt": datetime.now().isoformat(),
-        "source": "LMS_BRIDGE",
-    })
+def _log(colour: str, tag: str, message: str) -> None:
+    print(f"\033[{colour}m[{tag}]\033[0m {message}", flush=True)
 
 
 class SyncSupervisor:
-    """Discovers readers, starts a worker for each, and replaces the dead ones."""
+    """Drains the spool when the LMS comes back, and answers the health check."""
 
     def __init__(self, config: SyncConfig | None = None) -> None:
         self._config = config or default_config
         self._db = LmsDatabase(self._config)
         self._spool = PunchSpool(self._config.spool_path)
         self._stop = threading.Event()
-        self._workers: dict[str, DeviceWorker] = {}
         self._thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
@@ -91,7 +69,7 @@ class SyncSupervisor:
                  f"as soon as the database answers")
 
         self._stop.clear()
-        self._thread = threading.Thread(target=self._supervise, name="biometric-supervisor",
+        self._thread = threading.Thread(target=self._run, name="biometric-spool-flush",
                                         daemon=True)
         self._thread.start()
 
@@ -102,81 +80,62 @@ class SyncSupervisor:
         self._db.close()
 
     # ------------------------------------------------------------------
-    # The supervision loop
+    # The flush loop
     # ------------------------------------------------------------------
 
-    def _supervise(self) -> None:
+    def _run(self) -> None:
         announced_outage = False
 
         while not self._stop.is_set():
+            self._stop.wait(self._config.spool_flush_seconds)
+            if self._stop.is_set():
+                break
+            if not self._spool.pending():
+                continue
+
             try:
-                devices = self._db.active_devices()
+                self._flush()
                 if announced_outage:
                     _log("1;32", "Bridge", "LMS database is reachable again")
                     announced_outage = False
             except LmsUnavailableError as exc:
                 if not announced_outage:
                     _log("1;31", "Bridge",
-                         f"LMS database unreachable ({exc}). Already-running readers "
-                         f"keep capturing; punches are held on disk and on the "
-                         f"devices themselves.")
+                         f"LMS database unreachable ({exc}). Punches pushed by the "
+                         f"readers are being held on disk and will be sent when it "
+                         f"answers; nothing is being lost.")
                     announced_outage = True
-                # Keep the workers we already have and try again next tick.
-                #
-                # NOT an empty list: that would be read as "every reader was
-                # unregistered" and would tear down every running worker the
-                # moment the database hiccuped. An outage tells us nothing about
-                # which readers exist, so the last known answer stands.
-                #
-                # Nothing is lost while this persists. The readers hold their own
-                # punches, and the sweep that runs when the database returns
-                # re-offers everything they have.
-                self._stop.wait(self._config.device_refresh_seconds)
-                continue
 
-            self._reconcile_workers(devices)
-            self._stop.wait(self._config.device_refresh_seconds)
+    def _flush(self) -> None:
+        """
+        Send everything held on disk, putting it back if the database refuses.
 
-        for worker in self._workers.values():
-            worker.join(timeout=2)
-
-    def _reconcile_workers(self, devices: list[dict[str, Any]]) -> None:
-        """Start a worker for anything new, and drop the ones no longer listed."""
-        wanted = {str(d["serial_no"]): d for d in devices if d.get("serial_no")}
-
-        for serial, device in wanted.items():
-            existing = self._workers.get(serial)
-            if existing is not None and existing.is_alive():
-                continue
-            if existing is not None:
-                # A worker only exits when its thread body returns, which it
-                # does on an unrecoverable setup problem (no pyzk, no address).
-                # Replacing it gives the next config change a chance to fix it.
-                _log("1;33", "Bridge", f"{serial}: worker had stopped, restarting")
-            worker = DeviceWorker(device, self._db, self._spool, self._config,
-                                  self._stop, on_punch=_broadcast_to_dashboard)
-            self._workers[serial] = worker
-            worker.start()
-
-        for serial in list(self._workers):
-            if serial not in wanted:
-                # Disabled or deleted in the console. The worker shares the
-                # supervisor's stop event, so it is not interrupted mid-batch;
-                # it is simply forgotten and will exit with everything else at
-                # shutdown. Nothing it has already read is lost.
-                _log("1;90", "Bridge", f"{serial}: no longer active, releasing worker")
-                self._workers.pop(serial, None)
+        Restoring on failure is the whole safety property. A pushed punch has no
+        second source — the reader considers it delivered and will never offer
+        it again — so a batch that leaves the spool and does not land in
+        Postgres has to go back into the spool, not into a log line.
+        """
+        waiting = self._spool.drain()
+        if not waiting:
+            return
+        try:
+            _, stored = self._db.save_punches(waiting)
+        except LmsUnavailableError:
+            self._spool.restore(waiting)
+            raise
+        except Exception:
+            self._spool.restore(waiting)
+            raise
+        _log("1;34", "Spool", f"flushed {len(waiting)} held punch(es), {stored} new")
 
     # ------------------------------------------------------------------
-    # For the dashboard
+    # For the health check
     # ------------------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
         return {
             "enabled": self._config.enabled,
             "configured": self._config.configured,
-            "workers": sorted(self._workers),
-            "alive": sorted(s for s, w in self._workers.items() if w.is_alive()),
             "spooled": self._spool.pending(),
         }
 
@@ -187,6 +146,9 @@ class SyncSupervisor:
         A live probe rather than a cached flag: the health endpoint is asked
         precisely when somebody suspects it cannot, and a value last refreshed
         two minutes ago is the one answer that is no use.
+
+        This is a probe of the LMS database, which is a server we own and can
+        route to — not of a reader, which is the thing that cannot be probed.
         """
         return self._db.healthy()
 

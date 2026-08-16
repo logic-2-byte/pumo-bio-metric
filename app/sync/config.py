@@ -49,43 +49,46 @@ class SyncConfig:
     # Timing
     # ------------------------------------------------------------------
 
-    #: How often to ask the reader for new punches.
-    poll_seconds: int = 5
-
-    #: How often to re-read the reader's ENTIRE memory rather than just the
-    #: tail. This is the safety net that makes every outage self-healing: the
-    #: device keeps its own log, so a full sweep re-offers everything it holds
-    #: and the unique constraint drops whatever already landed. Anything the
-    #: bridge missed while the network, the database or this process was down
-    #: is recovered by the next sweep without anybody intervening.
-    full_sync_seconds: int = 900
-
-    #: How often to write the heartbeat the console's online dot reads.
-    #: Comfortably inside the LMS default grace period of 15 minutes.
+    #: The finest resolution at which a reader's contact is written to the LMS.
+    #: Readers call in every few seconds; recording each one would be a dozen
+    #: UPDATEs a minute per device to move a timestamp the console reads against
+    #: a 15-minute grace period. See `app.sync.liveness` for the throttle.
     heartbeat_seconds: int = 60
 
-    #: Backoff between reconnect attempts to a reader that is not answering.
-    retry_seconds: int = 15
-    max_retry_seconds: int = 300
+    #: How often to try the spool again while the LMS database is down.
+    #:
+    #: Its own knob, and slower than the old poll loop, because it is not a
+    #: capture path — capture is the readers pushing, which keeps working
+    #: throughout. This is only how quickly a backlog clears once Postgres
+    #: answers again, and hammering a database that is already struggling is
+    #: not a way to make it answer sooner.
+    spool_flush_seconds: int = 60
 
-    #: How often to re-read `biometric_devices`, so a reader registered in the
-    #: console is picked up without restarting this service.
-    device_refresh_seconds: int = 120
+    # THE POLLING KNOBS ARE GONE: poll_seconds, full_sync_seconds,
+    # retry_seconds, max_retry_seconds and device_refresh_seconds all described
+    # an outbound loop that dialled each reader on TCP 4370. Readers push to us
+    # now, so there is no interval to tune — the device decides how often it
+    # calls, via `Delay` in the handshake this service answers with.
 
     # ------------------------------------------------------------------
     # Fallbacks
     # ------------------------------------------------------------------
 
-    #: Where punches go when the LMS database itself cannot be reached. The
-    #: device's own memory is the primary safety net; this is the second one,
-    #: for the case where the reader is fine and Postgres is not.
+    #: Where punches go when the LMS database cannot be reached.
+    #:
+    #: This matters more than it used to. A polled reader could always be asked
+    #: again — its memory was right there and the next sweep re-offered
+    #: everything. A pushed punch arrives exactly once: the reader considers it
+    #: delivered and will never send it again, so this file is the only copy
+    #: while Postgres is down.
     spool_path: str = "spool/pending_punches.jsonl"
 
     # THERE IS NO DEVICE CONFIGURATION HERE, deliberately.
     #
-    # Readers are registered in the LMS console and live in `biometric_devices`
-    # — serial, address, port, branch and all. This service reads that table and
-    # holds no opinion of its own about which devices exist.
+    # Readers are registered in the LMS console, and a reader announces itself
+    # by the serial it sends when it calls in. This service holds no opinion of
+    # its own about which devices exist and no longer even reads the list — it
+    # writes down whatever serial arrives, and the console resolves it.
     #
     # An earlier version accepted a single DEVICE_IP/DEVICE_SN pair here as a
     # bootstrap fallback. It was removed: a company runs one or two readers per
@@ -115,12 +118,8 @@ def load_config() -> SyncConfig:
         user=os.getenv("LMS_DB_USER", "").strip(),
         password=os.getenv("LMS_DB_PASSWORD", ""),
         sslmode=os.getenv("LMS_DB_SSLMODE", "prefer").strip() or "prefer",
-        poll_seconds=_int("LMS_SYNC_POLL_SECONDS", 5),
-        full_sync_seconds=_int("LMS_SYNC_FULL_SECONDS", 900),
         heartbeat_seconds=_int("LMS_SYNC_HEARTBEAT_SECONDS", 60),
-        retry_seconds=_int("LMS_SYNC_RETRY_SECONDS", 15),
-        max_retry_seconds=_int("LMS_SYNC_MAX_RETRY_SECONDS", 300),
-        device_refresh_seconds=_int("LMS_SYNC_DEVICE_REFRESH_SECONDS", 120),
+        spool_flush_seconds=_int("LMS_SYNC_SPOOL_FLUSH_SECONDS", 60),
         spool_path=os.getenv("LMS_SYNC_SPOOL", "spool/pending_punches.jsonl").strip(),
     )
 

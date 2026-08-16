@@ -1,8 +1,14 @@
 # Biometric capture service — runtime dependencies.
 
 # --- talking to the readers -------------------------------------------
-# The pyzk socket protocol (TCP 4370).
-pyzk>=0.9
+# Nothing. Readers are given this service's address and push to the ADMS /
+# iClock HTTP routes, so the web layer below IS the device protocol.
+#
+# `pyzk` (the TCP 4370 socket client) went with the outbound poller: a reader
+# sits on a branch LAN behind a router this service cannot route to, so dialling
+# it failed on healthy devices and cost egress to establish nothing. The only
+# remaining user is tools/list_device_admins.py, a hands-on diagnostic run from
+# inside the branch network — `pip install pyzk` by hand if you need it.
 
 # --- talking to the LMS -----------------------------------------------
 psycopg2-binary>=2.9.10

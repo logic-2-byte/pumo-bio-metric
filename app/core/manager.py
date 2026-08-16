@@ -1,25 +1,25 @@
 """
 Application startup and shutdown.
 
-Both capture paths are started here:
+THERE IS ONLY ONE CAPTURE PATH, and it needs nothing started. Readers are
+configured with this service's address and push to the ADMS/iClock routes in
+`app.router.iclock`; those are HTTP handlers, so serving them *is* the capture.
+Liveness rides along with them (`app.sync.liveness`), because a request from a
+reader is the reader proving it is up.
 
-  1. the LMS bridge (`app.sync`), which polls readers over the pyzk socket and
-     writes their punches into the LMS database
-  2. the ADMS/iClock listener in `app.router.iclock`, which is just HTTP routes
-     and needs nothing started
+WHAT WAS STARTED HERE BEFORE. A supervisor that ran one thread per registered
+reader, each dialling the device on TCP 4370 through `pyzk` — with an ICMP ping
+in front of every connect — polling its memory and stamping liveness down the
+same socket. It is gone. In production a reader is on a branch LAN behind a
+router this service cannot route to, so every connect failed on a device that
+was working perfectly, and the probes cost egress to establish nothing.
 
-The single-device `direct_device_socket_worker` that used to live in this file
-is gone. It has been replaced by `app.sync.device_worker`, which does what it
-did — live capture, user-name sync, the dashboard feed — and additionally
-writes to the LMS, recovers whatever a reader buffered while it was
-unreachable, and verifies that what the reader holds is what the database
-actually stored. Running both would have been actively harmful: these readers
-generally accept a single TCP connection at a time, so two pollers fight over
-it and each reads the other's grip as a dropped connection.
+The supervisor that remains does one unrelated job: flushing punches held on
+disk when the LMS database was unreachable. See `app.sync.supervisor`.
 """
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI
@@ -44,10 +44,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[Any]:  # noqa: ARG001
     if sync_config.configured:
         print(f"\n LMS sync      : \033[1;32mON\033[0m -> "
               f"{sync_config.host}:{sync_config.port}/{sync_config.name}")
-        print(" Reader list   : from biometric_devices, refreshed every "
-              f"{sync_config.device_refresh_seconds}s")
-        print(f" Full sweep    : every {sync_config.full_sync_seconds}s "
-              f"(recovers anything missed during an outage)")
+        print(" Liveness      : from the readers' own calls, recorded at most "
+              f"every {sync_config.heartbeat_seconds}s")
+        print(" Nothing is polled or pinged — point each reader at the address "
+              "above and it connects itself")
     else:
         print("\n LMS sync      : \033[1;31mNOT CONFIGURED\033[0m — set LMS_DB_HOST, "
               "LMS_DB_NAME, LMS_DB_USER, LMS_DB_PASSWORD")
@@ -58,3 +58,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[Any]:  # noqa: ARG001
     yield
 
     supervisor.stop()
+    # Drains the liveness writer so a stamp in flight is not lost on shutdown.
+    with suppress(Exception):
+        from app.sync.liveness import shutdown as stop_liveness
+
+        stop_liveness()

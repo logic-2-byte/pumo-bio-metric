@@ -10,8 +10,14 @@ So health here answers the questions an operator actually has:
 
   * is the process up                      -> /api/pulse
   * is the LMS reachable                   -> /api/health
-  * are the readers being polled           -> /api/health
   * is anything stuck waiting to be sent   -> /api/health
+
+"ARE THE READERS UP" IS NOT ONE OF THEM, and cannot be. Nothing here probes a
+reader — it is behind a branch router this service cannot route to — so this
+process has no way to answer that question at the moment it is asked. What it
+knows is when each reader last called in, which is a different and better
+answer, and it lives in the LMS console next to the reader rather than in a
+health endpoint an orchestrator reads.
 """
 
 from fastapi import APIRouter, status
@@ -39,13 +45,15 @@ def health_check() -> JSONResponse:
     """
     Readiness: is this service actually doing its job?
 
-    Returns 503 when the bridge cannot reach the LMS, because a bridge that
+    Returns 503 when this service cannot reach the LMS, because a bridge that
     cannot write is not ready in any useful sense — even though it is still
     capturing, and nothing is being lost while it holds punches on disk.
 
     A spool depth above zero is reported but is NOT unhealthy on its own: it is
     the mechanism working as designed. It matters only if it keeps growing,
-    which is what the number is there for.
+    which is what the number is there for. It matters more than it used to,
+    though: a pushed punch arrives once, so the spool is the only copy while
+    Postgres is down.
     """
     state = supervisor.status()
 
@@ -65,8 +73,6 @@ def health_check() -> JSONResponse:
     body = {
         "status": "ok" if reachable else "degraded",
         "lms_reachable": reachable,
-        "readers_polled": len(state["alive"]),
-        "readers_configured": len(state["workers"]),
         "punches_held_on_disk": state["spooled"],
     }
     code = status.HTTP_200_OK if reachable else status.HTTP_503_SERVICE_UNAVAILABLE

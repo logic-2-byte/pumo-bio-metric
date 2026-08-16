@@ -1,21 +1,20 @@
 # Production.
 #
-# ONE INSTANCE PER SITE, and do not scale it. See the comment at the top of
-# gunicorn_config.py: a second process means a second connection to each
-# reader, and these readers accept one at a time.
+# WHERE THIS CAN RUN — and it is now a free choice, which it was not before.
 #
-# WHERE THIS CAN RUN, which is not a free choice:
+# The only requirement is that the READERS can reach THIS service. Each one is
+# given this address in its own menu (Comm -> Cloud Server / ADMS) and connects
+# outbound; nothing here connects to a device. A cloud VM with a public address
+# is therefore a perfectly good home for it, and no VPN to the branch is needed.
 #
-#   * Polling (pyzk, TCP 4370) requires this container to reach the readers at
-#     their LAN addresses. That works on a branch box. It does NOT work from a
-#     cloud VM unless there is a VPN to the branch network.
-#   * ADMS/iClock push requires the readers to reach THIS service. That works
-#     from a cloud VM only if the branch can route to it.
+# THE CONSTRAINT THIS REPLACES: the service used to also poll each reader over
+# TCP 4370, which required routing INTO the branch LAN. On a cloud VM that half
+# was inert — every connect failed on a healthy device, once per reader every
+# few seconds, and the failures were being reported as devices going offline.
+# The poller is deleted; `python -m app.sync.run` no longer starts anything.
 #
-# Deployed to a VM without a VPN, the polling half is inert and only pushed
-# punches arrive — which also loses the reader-memory sweep that recovers an
-# outage. For the polling bridge, run it at the branch, either with this file
-# or with `python -m app.sync.run`.
+# ONE INSTANCE PER SITE is still the rule, but for a smaller reason: see the
+# comment at the top of gunicorn_config.py.
 
 services:
   app:

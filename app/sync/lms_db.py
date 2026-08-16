@@ -1,22 +1,26 @@
 """
-The LMS database, and the only three things this bridge does to it.
+The LMS database, and the only two things this service does to it.
 
-  1. read `biometric_devices` to learn which readers to talk to
-  2. insert into `biometric_punch_log`
-  3. stamp a heartbeat so the console can tell a quiet reader from a dead one
+  1. insert into `biometric_punch_log`
+  2. stamp contact so the console can tell a quiet reader from a dead one
 
 Nothing here writes attendance. The LMS reconciler turns these raw rows into
-`staff_punches` on its own schedule; this bridge deliberately knows nothing
+`staff_punches` on its own schedule; this service deliberately knows nothing
 about employees, work dates or directions, because a second program deciding
 what a punch means is how the two end up disagreeing.
+
+WHAT USED TO BE HERE AND IS NOT ANY MORE: a read of `biometric_devices` to
+learn which readers to dial, and a count query to verify a poll sweep. Both
+belonged to the outbound model, where this service connected to each reader on
+TCP 4370. Readers now call us, so there is no list to fetch — a device
+announces itself by its serial when it arrives — and no sweep to verify,
+because there is no re-reading of a device's memory to check against.
 """
 from __future__ import annotations
 
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
-from datetime import datetime
-from typing import Any
 
 import psycopg2
 import psycopg2.extras
@@ -108,37 +112,7 @@ class LmsDatabase:
             return False
 
     # ------------------------------------------------------------------
-    # 1. Which readers to talk to
-    # ------------------------------------------------------------------
-
-    def active_devices(self) -> list[dict[str, Any]]:
-        """
-        The readers the console says are in service.
-
-        The console is where an operator registers a device, so the console is
-        where the list comes from — adding one there is picked up here within a
-        couple of minutes without touching a config file or restarting anything.
-
-        DISABLED readers are excluded by the query: disabling one is how you
-        take a reader out of service, and a bridge that kept polling it would
-        make that button do nothing visible.
-        """
-        with self._connection() as conn, conn.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cur:
-            cur.execute(
-                """
-                SELECT id, name, serial_no, ip_address, port, branch_id
-                  FROM biometric_devices
-                 WHERE status = 'ACTIVE'
-                   AND ip_address IS NOT NULL
-                 ORDER BY id
-                """
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-    # ------------------------------------------------------------------
-    # 2. The punches
+    # 1. The punches
     # ------------------------------------------------------------------
 
     def save_punches(self, punches: Sequence[Punch]) -> tuple[int, int]:
@@ -184,36 +158,32 @@ class LmsDatabase:
             )
             return (len(rows), len(inserted))
 
-    def count_stored(self, serial_no: str, since: datetime) -> int:
-        """
-        How many rows the LMS holds for this reader since a given time.
-
-        The verification half of the sync. The device says it has N punches in
-        that window; if this returns fewer, something was dropped and the next
-        full sweep needs to say so out loud rather than reporting success.
-        """
-        with self._connection() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM biometric_punch_log
-                 WHERE device_serial = %s AND device_time >= %s
-                """,
-                (serial_no, since),
-            )
-            return int(cur.fetchone()[0])
-
     # ------------------------------------------------------------------
-    # 3. Liveness
+    # 2. Liveness
     # ------------------------------------------------------------------
 
     def heartbeat(self, serial_no: str, *, ip_address: str | None = None,
-                  model: str | None = None, firmware: str | None = None) -> None:
+                  model: str | None = None, firmware: str | None = None) -> bool:
         """
-        Record that we just spoke to this reader.
+        Record that this reader just called in.
 
-        Clearing `offline_alerted_at` here is not incidental — it is what re-arms
-        the LMS watchdog. Without it the next genuine outage would inherit this
-        one's silence and never warn.
+        Contact reported after the fact, never a probe: the device opened the
+        connection, and this is where that fact is written down. See
+        `app.sync.liveness` for why there is nothing to probe.
+
+        `ip_address` is the address it connected FROM, which is worth keeping
+        current — a branch router hands out a new lease and the console should
+        show where the unit actually is. Nothing connects to it.
+
+        Clearing `offline_alerted_at` is not incidental: it is what re-arms the
+        LMS watchdog. Without it the next genuine outage would inherit this
+        one's silence and never warn. `last_error` is cleared for the same
+        reason — a clean contact means whatever went wrong last time is no
+        longer what is happening.
+
+        :return: True if a registered reader was updated. False means no row
+            carries this serial — the device is talking to us but nobody has
+            registered it in the console.
         """
         with self._connection() as conn, conn.cursor() as cur:
             cur.execute(
@@ -229,14 +199,18 @@ class LmsDatabase:
                 """,
                 (ip_address, model, firmware, serial_no),
             )
+            return bool(cur.rowcount > 0)
 
-    def record_error(self, serial_no: str, message: str) -> None:
+    def record_traffic_error(self, serial_no: str, message: str) -> None:
         """
-        A failed attempt to reach a reader.
+        Note that something in this reader's traffic could not be handled.
 
-        Deliberately does NOT touch `last_seen_at`: the bridge is alive, the
-        reader is not, and moving the heartbeat here would make a dead device
-        look healthy for as long as this service keeps failing to reach it.
+        Deliberately does NOT touch `last_seen_at`, but not for the reason its
+        predecessor did not. The old `record_error` withheld contact because it
+        meant "we tried to reach the device and failed", and stamping it would
+        have made a dead reader look healthy. This one leaves the column alone
+        simply because it is not its job: the device demonstrably called in, and
+        `heartbeat` has already recorded that for this same request.
         """
         with self._connection() as conn, conn.cursor() as cur:
             cur.execute(

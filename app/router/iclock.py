@@ -60,8 +60,42 @@ def save_user_cache():
 # SSE subscriber queues for real-time web dashboard
 SSE_SUBSCRIBERS: list[asyncio.Queue] = []
 
-# Global cache for device sync times
+# Global cache for device sync times, for this service's own dashboard.
 LAST_SYNC_TIMES: dict[str, float] = {}
+
+
+def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = False) -> None:
+    """
+    Record that a reader just called in — here and in the LMS.
+
+    THIS IS THE WHOLE OF LIVENESS NOW. Nothing probes a reader: it is on a
+    branch LAN behind a router this service cannot route to, so a probe would
+    fail on a healthy device and cost egress to say so. But the reader calls
+    *us* every few seconds whether or not anybody punched, and every one of
+    those requests is the device proving it is up, for free.
+
+    So every iClock handler calls this. The in-memory map feeds this service's
+    own dashboard; `app.sync.liveness` writes the LMS column the console's
+    online dot reads, throttled and off the request path.
+    """
+    if not sn:
+        return
+    LAST_SYNC_TIMES[sn] = time.time()
+
+    client_ip = None
+    if request is not None and request.client:
+        client_ip = request.client.host
+
+    # Imported here rather than at module import so this router still loads on
+    # a host without the sync package's dependencies — the local dashboard is
+    # expected to work standalone.
+    try:
+        from app.sync.liveness import mark_seen as record_contact
+
+        record_contact(sn, ip_address=client_ip, force=force)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"\033[1;33m[Liveness]\033[0m {sn}: not recorded ({exc})", flush=True)
+
 
 # Verification type human-readable mapping
 VERIFY_MODES = {
@@ -87,15 +121,36 @@ PUNCH_STATUS_MAP = {
 
 
 def get_local_ips() -> list[str]:
-    """Helper: Get local network IPv4 addresses to show in console and dashboard."""
-    ips = []
+    """
+    Local IPv4 addresses to show in the console and dashboard, best first.
+
+    "Best" matters because the first one is what an operator types into a
+    reader. A dev box carries virtual adapters — WSL, Hyper-V, Docker — whose
+    addresses hostname resolution happily returns first, and those subnets
+    exist only inside this host: a reader pointed at one can never reach us.
+
+    So the address the machine actually routes off itself with is asked for
+    directly (the UDP connect picks a route without sending a packet) and put
+    at the front; the rest follow for reference, link-local last.
+    """
+    ips: list[str] = []
+
     try:
-        hostname = socket.gethostname()
-        for ip in socket.gethostbyname_ex(hostname)[2]:
-            if not ip.startswith("127."):
-                ips.append(ip)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            ips.append(probe.getsockname()[0])
     except Exception:
         pass
+
+    try:
+        hostname = socket.gethostname()
+        others = [ip for ip in socket.gethostbyname_ex(hostname)[2] if not ip.startswith("127.")]
+        # 169.254.x is APIPA — an adapter that never got a lease. Never useful.
+        others.sort(key=lambda ip: ip.startswith("169.254."))
+        ips.extend(ip for ip in others if ip not in ips)
+    except Exception:
+        pass
+
     return ips if ips else ["127.0.0.1"]
 
 
@@ -492,7 +547,10 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     sn = get_query_param_ci(request, "SN") or "DEFAULT"
     table = (get_query_param_ci(request, "table") or "").upper()
     client_ip = request.client.host if request.client else "unknown"
-    LAST_SYNC_TIMES[sn] = time.time()
+    # A handshake is forced past the throttle: it is a reader announcing itself
+    # after a restart or a config change, and that is the one contact worth
+    # recording the instant it happens rather than up to a minute later.
+    mark_seen(sn, request, force=request.method == "GET")
 
     # 1.1 Device Handshake / Initialization (GET)
     if request.method == "GET":
@@ -566,7 +624,14 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
             elif stored:
                 print(f"\033[1;34m[LMS]\033[0m {sn}: stored {stored} new punch(es)")
         except Exception as exc:
+            # Recorded against the reader so the console shows why its punches
+            # stopped landing. It does NOT mark the device down — it called in,
+            # which is why we are here; see `app.sync.liveness`.
             print(f"\033[1;31m[LMS]\033[0m {sn}: sync unavailable ({exc})")
+            with suppress(Exception):
+                from app.sync.liveness import record_traffic_error
+
+                record_traffic_error(sn, f"{type(exc).__name__}: {exc}")
     else:
         print(f"\033[36m[iClock Data POST]\033[0m Device: \033[33m{sn}\033[0m | Table: {effective_table or 'N/A'} | Bytes: {len(raw_body)}")
         if body_str and len(body_str) < 300:
@@ -583,9 +648,12 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
 @router.api_route("/iclock/getrequest.php", methods=["GET", "POST"])
 @router.api_route("/getrequest.php", methods=["GET", "POST"])
 async def getrequest_handler(request: Request) -> PlainTextResponse:
+    # The steady-state heartbeat. A reader polls this every few seconds for
+    # commands even when nobody has touched it all morning, which is exactly
+    # what makes it the right signal for "is this thing alive" — a quiet reader
+    # and a dead one are indistinguishable by punches alone.
     sn = get_query_param_ci(request, "SN")
-    if sn:
-        LAST_SYNC_TIMES[sn] = time.time()
+    mark_seen(sn, request)
     return PlainTextResponse("OK", media_type="text/plain")
 
 
@@ -600,8 +668,7 @@ async def devicecmd_handler(request: Request) -> PlainTextResponse:
     sn = get_query_param_ci(request, "SN")
     raw_body = await request.body()
     body_str = raw_body.decode(errors="ignore")
-    if sn:
-        LAST_SYNC_TIMES[sn] = time.time()
+    mark_seen(sn, request)
     print(f"\033[34m[iClock DeviceCmd Response]\033[0m Device: {sn} | Body: {body_str}")
     return PlainTextResponse("OK", media_type="text/plain")
 
@@ -615,17 +682,24 @@ async def devicecmd_handler(request: Request) -> PlainTextResponse:
 @router.api_route("/fdata.php", methods=["GET", "POST"])
 async def fdata_handler(request: Request) -> PlainTextResponse:
     table = get_query_param_ci(request, "table", "N/A")
+    mark_seen(get_query_param_ci(request, "SN"), request)
     print(f"\033[34m[iClock FData Push]\033[0m Table: {table}")
     return PlainTextResponse("OK", media_type="text/plain")
 
 
-# 5. PING / PUSH / REGISTRY Heartbeats
+# 5. PUSH / REGISTRY / PING heartbeats
+#
+# NOTE ON THE NAME: `/iclock/ping` is the DEVICE pinging US. It is inbound —
+# some firmware calls it before it will start pushing — and it is the opposite
+# of the outbound probe this service used to run. Keep it; it is one more piece
+# of evidence that a reader is alive, arriving unasked.
 @router.api_route("/iclock/push", methods=["GET", "POST"])
 @router.api_route("/push", methods=["GET", "POST"])
 @router.api_route("/iclock/ping", methods=["GET", "POST"])
 @router.api_route("/ping", methods=["GET", "POST"])
 @router.api_route("/iclock/registry", methods=["GET", "POST"])
 @router.api_route("/registry", methods=["GET", "POST"])
-async def ping_handler() -> PlainTextResponse:
+async def ping_handler(request: Request) -> PlainTextResponse:
     """Heartbeat routes. Some firmware calls these before it will push."""
+    mark_seen(get_query_param_ci(request, "SN"), request)
     return PlainTextResponse("OK", media_type="text/plain")
