@@ -27,6 +27,25 @@ services:
     env_file:
       - .env
 
+    # Two networks, and the second one is not optional when the LMS is on this
+    # same host.
+    #
+    # This project deploys to ~/pumo-biometric-server, so compose names it
+    # `pumo-biometric-server` and gives it a private `default` bridge. The LMS
+    # stack is a SEPARATE compose project (`lms`, in /opt/lms) with its own
+    # `internal` bridge, and Docker's embedded DNS does not resolve names
+    # across projects. On the default network alone, LMS_DB_HOST=postgres does
+    # not resolve to anything — the bridge cannot see the database at all, and
+    # every punch it captures goes to the spool and stays there.
+    #
+    # Joining lms_internal puts this container on the same bridge as the
+    # `postgres` service, which is what makes that hostname mean something.
+    # The LMS stack publishes no database port, deliberately, so this is also
+    # the only route in.
+    networks:
+      - default
+      - lms_internal
+
     volumes:
       # The spool must outlive the container.
       #
@@ -44,4 +63,19 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+networks:
+  # Created by the LMS stack (/opt/lms/compose.prod.yaml declares `name: lms`
+  # and a network called `internal`, which Docker names `lms_internal`).
+  #
+  # `external: true` means "attach to it, do not create it" — so this file
+  # never races the LMS stack for ownership of the network, and `docker
+  # compose down` here cannot take the LMS's own bridge with it.
+  #
+  # It also makes the LMS stack a hard prerequisite: if that network does not
+  # exist, `up` fails immediately with a named error instead of starting a
+  # container that silently cannot reach the database. Confirm the name with
+  # `docker network ls` if the LMS project is ever renamed.
+  lms_internal:
+    external: true
 

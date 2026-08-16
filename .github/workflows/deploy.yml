@@ -72,6 +72,23 @@ jobs:
             echo "$ENV_CONTENT" > .env
             chmod 600 .env
 
+            # The two bind-mounted directories, created here rather than by
+            # Docker.
+            #
+            # A bind mount whose host path does not exist is created by the
+            # daemon as root:root. The image runs as the unprivileged
+            # `biometric` user (uid 10001, see the Dockerfile), so the spool it
+            # is supposed to write to would be owned by a user it is not — and
+            # the spool is the only copy of a pushed punch between arriving and
+            # reaching the LMS. It fails at the first punch, not at boot, which
+            # is the worst time to find out.
+            #
+            # Numeric ids because the host has no `biometric` user; the uid is
+            # what the kernel actually checks.
+            mkdir -p spool data/logs
+            sudo chown -R 10001:10001 spool data/logs 2>/dev/null \
+              || chown -R 10001:10001 spool data/logs
+
             # Detect whether VM uses modern 'docker compose' or legacy 'docker-compose'
             if docker compose version >/dev/null 2>&1; then
               DC="docker compose"
@@ -87,4 +104,27 @@ jobs:
 
             echo "Starting services..."
             $DC up -d --force-recreate
+
+            # Verify, rather than trusting `up -d` to mean "running".
+            #
+            # `up -d` returns 0 for a container that started and then died —
+            # which is exactly what happened on the release that prompted this
+            # step: gunicorn exited 3 within seconds, the job went green, and
+            # nobody knew the bridge was down until attendance stopped
+            # appearing in the console.
+            echo "Waiting for the service to answer..."
+            for _ in $(seq 1 20); do
+              if $DC exec -T app python -c \
+                   "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/pulse', timeout=5).status==200 else 1)" \
+                   >/dev/null 2>&1; then
+                echo "Biometric bridge is up."
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "::error::The biometric bridge did not answer within 100s."
+            $DC ps
+            $DC logs --tail=200 app
+            exit 1
 
