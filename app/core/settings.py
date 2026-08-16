@@ -1,4 +1,5 @@
 from typing import Any
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -13,10 +14,7 @@ class Settings(BaseSettings):
         if v == "" or v is None:
             return False
         if isinstance(v, str):
-            v_lower = v.lower()
-            if v_lower in ("true", "1", "yes", "on", "t"):
-                return True
-            return False
+            return v.lower() in ("true", "1", "yes", "on", "t")
         return bool(v)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")

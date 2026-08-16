@@ -2,9 +2,18 @@ import logging
 
 from loguru import logger as _log
 
+from app.constants import LOG_PATH
+
 
 def setup_logger(with_debug: bool = False) -> None:
-    log_path = "data/logs"
+    """
+    Register the file sinks.
+
+    Call this EXACTLY once, from app.main. A second call adds a second set of
+    sinks and every line is then written twice — which is what happened while
+    a duplicate setup_logger lived in app/core/config.py alongside this one.
+    """
+    log_path = LOG_PATH
 
     # App Info Log
     _log.add(

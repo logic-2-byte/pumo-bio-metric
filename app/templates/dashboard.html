@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>eSSL / ZKTeco Live Attendance Monitor (FastAPI)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #131b2e;
+      --card-border: #1f2d4d;
+      --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.2);
+      --success: #10b981;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--card-border);
+      margin-bottom: 24px;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .logo-area h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      color: var(--success);
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      background: var(--success);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--success);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
+    .info-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 18px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .card-title {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .card-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.15rem;
+      color: var(--accent);
+      word-break: break-all;
+    }
+    .table-container {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .table-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .table-header h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .btn-clear {
+      background: transparent;
+      border: 1px solid #ef4444;
+      color: #ef4444;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 500;
+      transition: all 0.2s;
+    }
+    .btn-clear:hover {
+      background: #ef4444;
+      color: #fff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.9rem;
+    }
+    th {
+      background: rgba(255, 255, 255, 0.03);
+      padding: 12px 20px;
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--card-border);
+    }
+    td {
+      padding: 14px 20px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.88rem;
+    }
+    tr.new-row {
+      animation: highlight 3s ease-out;
+    }
+    @keyframes highlight {
+      0% { background: rgba(56, 189, 248, 0.25); }
+      100% { background: transparent; }
+    }
+    .empty-state {
+      padding: 48px 20px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="logo-area">
+        <h1>eSSL / ZKTeco Push Listener (FastAPI)</h1>
+      </div>
+      <div class="badge">
+        <div class="badge-dot"></div>
+        Server Listening (ADMS / iClock)
+      </div>
+    </header>
+
+    <div class="info-grid">
+      <div class="card">
+        <div class="card-title">Machine ADMS Server IP</div>
+        <div class="card-value">__SERVER_IP__</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Machine ADMS Server Port</div>
+        <div class="card-value">__SERVER_PORT__</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Push Endpoint Path</div>
+        <div class="card-value">/iclock/cdata</div>
+      </div>
+    </div>
+
+    <div class="table-container">
+      <div class="table-header">
+        <h2>Live Attendance Punches (<span id="count">0</span>)</h2>
+        <div style="display: flex; gap: 10px;">
+          <button class="btn-clear" style="border-color: var(--accent); color: var(--accent);" onclick="promptAddName()">➕ Set Employee Name</button>
+          <button class="btn-clear" onclick="clearLogs()">Clear History</button>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>User Name</th>
+            <th>User ID</th>
+            <th>Role</th>
+            <th>Punch Time</th>
+            <th>Attendance State</th>
+            <th>Verification</th>
+            <th>Device</th>
+            <th>Received At</th>
+          </tr>
+        </thead>
+        <tbody id="logs-body">
+          <tr id="empty-row"><td colspan="8" class="empty-state">Waiting for biometric punch logs from device...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let logs = [];
+
+    function getStatusBadge(status, label) {
+      const s = String(status);
+      const l = label || (s === '0' ? 'Check-In' : (s === '1' ? 'Check-Out' : (s === '255' ? 'Present' : 'Punch ' + s)));
+      if (s === '0' || l.toLowerCase().includes('in')) {
+        return `<span style="background: rgba(16, 185, 129, 0.2); color: #10b981; padding: 3px 8px; border-radius: 6px; font-weight: 600; font-size: 0.8rem; border: 1px solid rgba(16, 185, 129, 0.3);">🟢 ${l}</span>`;
+      } else if (s === '1' || l.toLowerCase().includes('out')) {
+        return `<span style="background: rgba(245, 158, 11, 0.2); color: #f59e0b; padding: 3px 8px; border-radius: 6px; font-weight: 600; font-size: 0.8rem; border: 1px solid rgba(245, 158, 11, 0.3);">🟠 ${l}</span>`;
+      } else {
+        return `<span style="background: rgba(56, 189, 248, 0.2); color: #38bdf8; padding: 3px 8px; border-radius: 6px; font-weight: 600; font-size: 0.8rem; border: 1px solid rgba(56, 189, 248, 0.3);">🔵 ${l}</span>`;
+      }
+    }
+
+    function getVerifyBadge(type, label) {
+      const t = String(type);
+      const l = label || (t === '1' ? 'Fingerprint' : (t === '0' ? 'Password' : (t === '2' ? 'RFID Card' : (t === '4' || t === '15' ? 'Face' : 'Biometric'))));
+      let icon = '👆';
+      if (t === '0') icon = '🔑';
+      else if (t === '2') icon = '💳';
+      else if (t === '4' || t === '15') icon = '👁️';
+      return `<span style="color: #cbd5e1;">${icon} ${l}</span>`;
+    }
+
+    function renderRow(p, isNew = false) {
+      const tr = document.createElement('tr');
+      if (isNew) tr.className = 'new-row';
+      const name = p.userName || ('User ' + (p.userId || ''));
+      const role = p.userRole || 'User';
+      const statusBadge = getStatusBadge(p.status, p.statusLabel);
+      const verifyBadge = getVerifyBadge(p.verifyType, p.verifyLabel);
+
+      tr.innerHTML = `
+        <td style="color: #fff; font-weight: 600;">
+          <span style="cursor: pointer; border-bottom: 1px dashed rgba(255,255,255,0.4);" onclick="editUserName('${p.userId}', '${name}')" title="Click to edit employee name">${name} ✏️</span>
+        </td>
+        <td style="color: var(--accent); font-weight: 600;">${p.userId}</td>
+        <td><span style="background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; color: #94a3b8;">${role}</span></td>
+        <td style="color: #e2e8f0;">${p.timestamp}</td>
+        <td>${statusBadge}</td>
+        <td>${verifyBadge}</td>
+        <td style="color: var(--text-muted); font-size: 0.8rem;">${p.sn}</td>
+        <td style="color: var(--text-muted); font-size: 0.78rem;">${p.receivedAt ? p.receivedAt.split('T')[1].split('.')[0] : ''}</td>
+      `;
+      return tr;
+    }
+
+    function editUserName(userId, currentName) {
+      const newName = prompt(`Enter Employee Name for User ID ${userId}:`, currentName.startsWith('User ') ? '' : currentName);
+      if (newName && newName.trim()) {
+        fetch('/api/users/set_name', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: String(userId), name: newName.trim() })
+        })
+        .then(res => res.json())
+        .then(() => loadInitial());
+      }
+    }
+
+    function promptAddName() {
+      const userId = prompt("Enter Employee User ID / PIN on machine (e.g. 102):");
+      if (userId && userId.trim()) {
+        const name = prompt(`Enter Full Name for Employee ID ${userId.trim()}:`);
+        if (name && name.trim()) {
+          fetch('/api/users/set_name', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: userId.trim(), name: name.trim() })
+          })
+          .then(res => res.json())
+          .then(() => loadInitial());
+        }
+      }
+    }
+
+    function loadInitial() {
+      fetch('/api/punches')
+        .then(res => res.json())
+        .then(res => {
+          logs = res.data || [];
+          document.getElementById('count').innerText = logs.length;
+          const tbody = document.getElementById('logs-body');
+          if (logs.length > 0) {
+            tbody.innerHTML = '';
+            logs.forEach(p => tbody.appendChild(renderRow(p)));
+          }
+        });
+    }
+
+    function clearLogs() {
+      fetch('/api/clear', { method: 'POST' }).then(() => {
+        logs = [];
+        document.getElementById('count').innerText = '0';
+        document.getElementById('logs-body').innerHTML = '<tr id="empty-row"><td colspan="8" class="empty-state">Waiting for biometric punch logs from device...</td></tr>';
+      });
+    }
+
+    // Connect SSE for Real-time Updates
+    const evtSource = new EventSource('/events');
+    evtSource.onmessage = (event) => {
+      try {
+        const punch = JSON.parse(event.data);
+        const tbody = document.getElementById('logs-body');
+        const emptyRow = document.getElementById('empty-row');
+        if (emptyRow) emptyRow.remove();
+
+        logs.unshift(punch);
+        document.getElementById('count').innerText = logs.length;
+        tbody.insertBefore(renderRow(punch, true), tbody.firstChild);
+      } catch (err) {}
+    };
+
+    loadInitial();
+  </script>
+</body>
+</html>

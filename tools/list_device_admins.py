@@ -1,4 +1,8 @@
+import os
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 try:
     from zk import ZK
@@ -11,8 +15,8 @@ except ImportError:
     sys.exit(1)
 
 
-DEVICE_IP = "192.168.29.201"
-PORT = 4370
+DEVICE_IP = os.getenv("DEVICE_IP", "192.168.0.210")
+PORT = int(os.getenv("DEVICE_PORT", "4370"))
 
 def list_admins():
     print(f"Connecting to biometric device at {DEVICE_IP}:{PORT}...")

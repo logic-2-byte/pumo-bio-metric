@@ -1,0 +1,33 @@
+# Keep the image to what actually runs.
+#
+# .env is listed first and matters most: configuration comes from the
+# environment at run time, and baking a file with the LMS database password
+# into an image puts that password in the registry.
+.env
+.env.*
+!.env.example
+
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+.git/
+.github/
+.vscode/
+.idea/
+
+tests/
+tools/
+data/
+spool/
+
+*.md
+LICENSE
+docker-compose*.yml
+bandit.yml
+.pre-commit-config.yaml
+requirements-dev.txt

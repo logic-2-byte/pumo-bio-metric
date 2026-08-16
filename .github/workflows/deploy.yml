@@ -27,14 +27,13 @@ jobs:
           context: .
           push: true
           tags: logic2byte/gym-biometric-server:latest
-          build-args: |
-            DEBUG=${{ secrets.DEBUG }}
-            APP_ENV=${{ secrets.APP_ENV }}
-            DB_HOST=${{ secrets.DB_HOST }}
-            DB_PORT=${{ secrets.DB_PORT }}
-            DB_NAME=${{ secrets.DB_NAME }}
-            DB_USER=${{ secrets.DB_USER }}
-            DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          # No build-args.
+          #
+          # This step used to pass DB_HOST/DB_USER/DB_PASSWORD as build args,
+          # which bakes them into image layers — anyone who can pull the image
+          # can read them back out with `docker history`, and they are pushed
+          # to Docker Hub on every release. Configuration reaches the container
+          # at RUN time, from the .env the deploy job writes.
 
 
   deploy:

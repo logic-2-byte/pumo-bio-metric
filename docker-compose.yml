@@ -1,13 +1,46 @@
-version: '3.8'
+# Local / on-site development.
+#
+# The production file is docker-compose.prod.yml, which pulls a published
+# image instead of building one.
 
 services:
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: gym-biometric-server
+    container_name: biometric-capture
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+
+    # host networking, and why it is not a port mapping.
+    #
+    # The bridge has to reach readers at their LAN addresses (192.168.x.x:4370)
+    # and readers configured for ADMS push have to reach this service back.
+    # Both directions work far more reliably on the host's own network than
+    # through a bridge network and a published port — particularly the push
+    # direction, where the reader's firmware sees the container's NAT address
+    # rather than the host it was told to talk to.
+    #
+    # On Docker Desktop for Windows/macOS host networking is limited; there,
+    # comment this out and use the ports mapping below instead. Readers must
+    # then be on a network the container can route to.
+    network_mode: host
+    # ports:
+    #   - "8000:8000"
+
     env_file:
       - .env
+
+    volumes:
+      # Punches held here when the LMS is unreachable. On the host, not in the
+      # container layer — recreating the container must not discard attendance
+      # that has not reached the database yet.
+      - ./spool:/srv/app/spool
+      - ./data/logs:/srv/app/data/logs
+
+    logging:
+      # Unbounded container logs have filled the disk on more than one branch
+      # box. This service is chatty by design (a banner per punch).
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

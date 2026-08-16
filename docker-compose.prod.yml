@@ -1,4 +1,21 @@
-version: '3.8'
+# Production.
+#
+# ONE INSTANCE PER SITE, and do not scale it. See the comment at the top of
+# gunicorn_config.py: a second process means a second connection to each
+# reader, and these readers accept one at a time.
+#
+# WHERE THIS CAN RUN, which is not a free choice:
+#
+#   * Polling (pyzk, TCP 4370) requires this container to reach the readers at
+#     their LAN addresses. That works on a branch box. It does NOT work from a
+#     cloud VM unless there is a VPN to the branch network.
+#   * ADMS/iClock push requires the readers to reach THIS service. That works
+#     from a cloud VM only if the branch can route to it.
+#
+# Deployed to a VM without a VPN, the polling half is inert and only pushed
+# punches arrive — which also loses the reader-memory sweep that recovers an
+# outage. For the polling bridge, run it at the branch, either with this file
+# or with `python -m app.sync.run`.
 
 services:
   app:
@@ -9,6 +26,25 @@ services:
       - "8000:8000"
     env_file:
       - .env
+
+    volumes:
+      # The spool must outlive the container.
+      #
+      # It is the only copy of a pushed punch between arriving and reaching the
+      # LMS, and the deploy job runs `up -d --force-recreate` on every release.
+      # Without this mount that command silently discards any attendance held
+      # during an LMS outage.
+      - ./spool:/srv/app/spool
+      - ./data/logs:/srv/app/data/logs
+
+    logging:
+      # This service prints a banner per punch. Unbounded json-file logs have
+      # filled small VM disks before.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
     networks:
       - gym-network
 

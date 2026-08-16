@@ -199,3 +199,12 @@ data/db/*
 # Exclude Alembic Versions [Only During Dev]
 alembic/versions/*
 # ----- Custom Ignores:END -----
+# Punches held on disk while the LMS database is unreachable. Runtime
+# state, and it can contain attendance data — never commit it.
+spool/
+
+# Runtime state of the local dashboard. Regenerated on the fly, and it
+# contains attendance data — never commit it.
+attendance_logs.json
+user_names.json
+data/logs/
