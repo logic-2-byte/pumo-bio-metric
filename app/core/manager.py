@@ -30,7 +30,7 @@ from app.sync.supervisor import supervisor
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[Any]:  # noqa: ARG001
+async def lifespan(app: FastAPI) -> AsyncIterator[Any]:
     port = 8000
     local_ip = (get_local_ips() or ["127.0.0.1"])[0]
 

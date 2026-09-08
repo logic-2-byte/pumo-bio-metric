@@ -29,7 +29,7 @@ except ImportError:
     sys.exit(1)
 
 
-DEVICE_IP = os.getenv("DEVICE_IP", "192.168.0.210")
+DEVICE_IP = os.getenv("DEVICE_IP", "192.168.1.209")
 PORT = int(os.getenv("DEVICE_PORT", "4370"))
 
 

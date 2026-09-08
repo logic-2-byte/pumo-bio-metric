@@ -1,0 +1,80 @@
+[
+  {
+    "id": 101,
+    "employeeCode": "EMP-101",
+    "name": "Member 1o",
+    "role": "Normal User",
+    "branchId": 2,
+    "department": "Engineering",
+    "access": [
+      {
+        "deviceSn": "NFZ8254900401",
+        "pin": "101",
+        "primary": true
+      },
+      {
+        "deviceSn": "UFZ9876543210",
+        "pin": "101",
+        "primary": false
+      }
+    ],
+    "transferHistory": [
+      {
+        "fromBranchId": 1,
+        "fromBranchName": "Main Campus (HQ)",
+        "toBranchId": 2,
+        "toBranchName": "Floor 2 / City Branch",
+        "effectiveDate": "2026-09-08",
+        "reason": "Transferred to new campus",
+        "biometricTransferred": true,
+        "biometricMode": "copy",
+        "biometricOk": true
+      }
+    ]
+  },
+  {
+    "id": 102,
+    "employeeCode": "EMP-102",
+    "name": "Gowtham",
+    "role": "Normal User",
+    "branchId": 1,
+    "department": "Operations",
+    "access": [
+      {
+        "deviceSn": "NFZ8254900401",
+        "pin": "102",
+        "primary": true
+      }
+    ]
+  },
+  {
+    "id": 111,
+    "employeeCode": "EMP-111",
+    "name": "ARULAJAY",
+    "role": "Super Admin",
+    "branchId": 1,
+    "department": "Management",
+    "access": [
+      {
+        "deviceSn": "NFZ8254900401",
+        "pin": "111",
+        "primary": true
+      }
+    ]
+  },
+  {
+    "id": 9999,
+    "employeeCode": "EMP-9999",
+    "name": "Master Super Admin",
+    "role": "Super Admin",
+    "branchId": 2,
+    "department": "Security",
+    "access": [
+      {
+        "deviceSn": "UFZ9876543210",
+        "pin": "9999",
+        "primary": true
+      }
+    ]
+  }
+]
