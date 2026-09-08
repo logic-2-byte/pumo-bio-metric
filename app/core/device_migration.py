@@ -671,9 +671,11 @@ def delete_device_user_real(
                     "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
                 }
             else:
-                c1 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
-                c2 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-                c3 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+                # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
+                c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
+                c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
+                c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+                c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
                 return {
                     "ok": True,
                     "simulated": False,
@@ -682,7 +684,7 @@ def delete_device_user_real(
                     "biometricsOnly": False,
                     "device": sn,
                     "userId": u_pin,
-                    "message": f"User delete command queued for {sn} via ADMS push protocol ({c1}). Machine will execute on next poll."
+                    "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
                 }
         except Exception as q_err:
             logger.exception("Failed to queue ADMS push delete command: %s", q_err)
