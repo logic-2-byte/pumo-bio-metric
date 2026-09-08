@@ -217,7 +217,7 @@ def get_user_info(user_id: str) -> dict:
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT s.first_name, s.last_name, s.designation, s.role
+                SELECT s.name, s.designation
                 FROM biometric_enrollments be
                 JOIN staff s ON be.staff_id = s.id
                 WHERE be.device_user_id = %s AND be.ignored = false
@@ -225,12 +225,11 @@ def get_user_info(user_id: str) -> dict:
             """, (u_id,))
             row = cur.fetchone()
             if row:
-                first, last, desig, role = row
-                full_name = f"{first or ''} {last or ''}".strip()
-                if full_name:
+                st_name, desig = row
+                if st_name:
                     info = {
-                        "name": full_name,
-                        "role": desig or role or "Staff",
+                        "name": st_name.strip(),
+                        "role": desig or "Staff",
                         "designation": desig or ""
                     }
                     DEVICE_USER_CACHE[u_id] = info
