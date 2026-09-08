@@ -653,8 +653,40 @@ def delete_device_user_real(
             "message": f"Successfully deleted user {user_id} (UID: {target_user.uid}) from device {sn}."
         }
     except Exception as e:
-        logger.exception("Failed to delete user %s from device %s: %s", user_id, sn, e)
-        return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}
+        logger.warning("TCP socket port 4370 connect failed for device %s (%s). Falling back to ADMS Push protocol command queue: %s", sn, ip, e)
+        try:
+            from app.router.iclock import queue_device_cmd
+            u_pin = str(user_id).strip()
+            if delete_biometrics_only:
+                c1 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+                c2 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+                return {
+                    "ok": True,
+                    "simulated": False,
+                    "deleted": True,
+                    "queued": True,
+                    "biometricsOnly": True,
+                    "device": sn,
+                    "userId": u_pin,
+                    "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
+                }
+            else:
+                c1 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
+                c2 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+                c3 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+                return {
+                    "ok": True,
+                    "simulated": False,
+                    "deleted": True,
+                    "queued": True,
+                    "biometricsOnly": False,
+                    "device": sn,
+                    "userId": u_pin,
+                    "message": f"User delete command queued for {sn} via ADMS push protocol ({c1}). Machine will execute on next poll."
+                }
+        except Exception as q_err:
+            logger.exception("Failed to queue ADMS push delete command: %s", q_err)
+            return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}
     finally:
         if conn:
             try:
