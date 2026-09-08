@@ -689,6 +689,19 @@ def delete_device_user_real(
         except Exception as q_err:
             logger.exception("Failed to queue ADMS push delete command: %s", q_err)
             return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}
+        finally:
+            if not delete_biometrics_only:
+                try:
+                    from app.sync.config import config
+                    from app.sync.lms_db import LmsDatabase
+                    db = LmsDatabase(config)
+                    with db._connection() as conn, conn.cursor() as cur:
+                        cur.execute("""
+                            DELETE FROM biometric_device_users 
+                            WHERE (device_serial = %s OR device_serial IS NULL) AND device_user_id = %s;
+                        """, (sn, str(user_id).strip()))
+                except Exception as del_err:
+                    logger.warning("Could not delete from biometric_device_users: %s", del_err)
     finally:
         if conn:
             try:

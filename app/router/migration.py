@@ -322,6 +322,31 @@ async def api_transfer_single_user(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content={"ok": False, "error": "Migration produced no result"})
 
     res = results[0]
+    if res.get("ok"):
+        try:
+            from app.sync.config import config
+            from app.sync.lms_db import LmsDatabase
+            db = LmsDatabase(config)
+            name_val = res.get("name") or res.get("userName") or f"User {user_id}"
+            actual_target_pin = str(res.get("targetUserId") or target_pin or user_id)
+            with db._connection() as conn, conn.cursor() as cur:
+                # Insert or update target device user
+                cur.execute("""
+                    INSERT INTO biometric_device_users (device_serial, device_user_id, name, role)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (device_serial, device_user_id) 
+                    DO UPDATE SET name = EXCLUDED.name, updated_at = now();
+                """, (target_id, actual_target_pin, name_val, "Normal User"))
+                
+                # If move mode, remove from source device
+                if mode == "move":
+                    cur.execute("""
+                        DELETE FROM biometric_device_users 
+                        WHERE (device_serial = %s OR device_serial IS NULL) AND device_user_id = %s;
+                    """, (source_id, user_id))
+        except Exception as db_err:
+            logger.warning("Could not sync biometric_device_users table after transfer: %s", db_err)
+
     return JSONResponse(status_code=200 if res.get("ok") else 400, content=res)
 
 
