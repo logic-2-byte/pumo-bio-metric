@@ -253,6 +253,47 @@ def get_user_info(user_id: str) -> dict:
     return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
 
 
+
+def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str = None):
+    """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
+    try:
+        from app.sync.config import config
+        from app.sync.lms_db import LmsDatabase
+        clean_pin = str(pin).strip()
+        clean_name = str(name).strip()
+        clean_role = str(role or "Normal User").strip()
+        clean_sn = str(sn or "UNKNOWN").strip().upper()
+        if not clean_pin or not clean_name or clean_name.startswith("User "):
+            return
+
+        db = LmsDatabase(config)
+        with db._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO biometric_device_users (device_serial, device_user_id, name, role, card_no, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (device_serial, device_user_id)
+                DO UPDATE SET 
+                    name = EXCLUDED.name, 
+                    role = EXCLUDED.role, 
+                    card_no = COALESCE(EXCLUDED.card_no, biometric_device_users.card_no),
+                    updated_at = now();
+            """, (clean_sn, clean_pin, clean_name, clean_role, str(card) if card else None))
+            
+            # Also retroactively update punches in biometric_punch_log that were recorded with 'User <pin>' or NULL
+            cur.execute("""
+                UPDATE biometric_punch_log
+                SET user_name = %s
+                WHERE (device_serial = %s OR %s = 'UNKNOWN') 
+                  AND device_user_id = %s 
+                  AND (user_name IS NULL OR user_name LIKE 'User %%' OR user_name = '');
+            """, (clean_name, clean_sn, clean_sn, clean_pin))
+            conn.commit()
+            print(f"\033[1;32m[DB Sync]\033[0m Persisted user {clean_pin} -> '{clean_name}' ({clean_role}) to biometric_device_users.", flush=True)
+    except Exception as exc:
+        print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
+
+
+
 def format_punch_banner(punch: dict, client_ip: str = "") -> str:
     """Helper: Format a high-visibility terminal banner with user name, role, and exact status."""
     user_id = str(punch.get("userId", "UNKNOWN")).strip()
@@ -512,6 +553,7 @@ def parse_userinfo(body_str: str, sn: str):
                 "name": name,
                 "role": role
             }
+            save_device_user_db(sn, pin, name, role)
             # Update any existing logs in memory that were waiting for this name
             for p in PUNCH_LOGS:
                 if str(p.get("userId", "")).strip() == pin:
@@ -625,6 +667,8 @@ async def auto_sync_device_users_bg(sn: str, client_ip: str | None = None):
 
     users = await asyncio.to_thread(_pull)
     if not users:
+        # TCP connection to port 4370 failed (e.g. reader behind NAT). Queue ADMS push query!
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
         return
 
     updated = 0
@@ -802,6 +846,14 @@ async def sync_device_punches(request: Request) -> JSONResponse:
     })
 
 
+
+@router.post("/api/device/query-users")
+async def trigger_query_users(sn: str = "NFZ8254900401"):
+    """Queue an ADMS command to query all user names from the hardware reader."""
+    cmd = queue_device_cmd(sn, "DATA QUERY USERINFO")
+    return {"ok": True, "message": f"Queued '{cmd}' for device {sn}. Machine will upload user list on next poll."}
+
+
 @router.get("/api/users")
 async def get_all_users():
     """Get all cached user names and roles."""
@@ -847,6 +899,8 @@ async def set_user_name(request: Request):
     except Exception:
         pass
 
+    device_sn = str(data.get("device_serial") or data.get("sn") or "NFZ8254900401").strip()
+    save_device_user_db(device_sn, user_id, name, role or current_info.get("role", "Normal User"))
     print(f"\033[1;32m[User Name Saved]\033[0m Mapped ID \033[1;33m{user_id}\033[0m -> \033[1;97m{name}\033[0m ({updated_count} punches updated)")
     return {"ok": True, "message": f"Updated name for User {user_id} to '{name}'", "updatedPunches": updated_count}
 
@@ -974,6 +1028,8 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Route by Table Type
     if "OPERLOG" in effective_table or "OPLOG" in effective_table:
         parse_oplog(body_str, sn)
+        # Any admin action on device (adding user, finger, card, etc.) -> query userinfo to learn real names
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     if "USERINFO" in effective_table or "USER" in effective_table:
@@ -989,6 +1045,7 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
             for p in new_punches
         )
         if has_unknown:
+            queue_device_cmd(sn, "DATA QUERY USERINFO")
             asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         for punch in new_punches:
