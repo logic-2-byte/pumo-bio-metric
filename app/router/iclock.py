@@ -12,6 +12,22 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 router = APIRouter(tags=["iclock"])
 
+# -----------------------------------------------------------------------------
+# ADMS Push Protocol Command Queue (for Cloud <-> Office Device remote control)
+# -----------------------------------------------------------------------------
+DEVICE_COMMAND_QUEUE: dict[str, list[str]] = {}
+_DEVICE_CMD_COUNTER: int = 1000
+
+def queue_device_cmd(sn: str, cmd_body: str) -> str:
+    """Queue an ADMS command to be dispatched on the device's next /iclock/getrequest poll."""
+    global _DEVICE_CMD_COUNTER
+    _DEVICE_CMD_COUNTER += 1
+    clean_sn = str(sn or "").strip().upper()
+    cmd_str = f"C:{_DEVICE_CMD_COUNTER}:{cmd_body.strip()}"
+    DEVICE_COMMAND_QUEUE.setdefault(clean_sn, []).append(cmd_str)
+    print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str}")
+    return cmd_str
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 LOGS_FILE = os.path.join(BASE_DIR, "attendance_logs.json")
 USER_NAMES_FILE = os.path.join(BASE_DIR, "user_names.json")
@@ -657,8 +673,23 @@ async def sync_device_punches(request: Request) -> JSONResponse:
             "verifyLabel": VERIFY_MODES.get(str(r.punch if r.punch is not None else 1), "Fingerprint")
         }
         broadcast_punch(punch_obj)
+        PUNCH_LOGS.insert(0, punch_obj)
         existing_keys.add((uid_str, ts_str))
         new_added += 1
+
+        # Store into PostgreSQL biometric_punch_log so LMS CRM receives the punches
+        try:
+            from app.sync.push_ingest import ingest
+            ingest([punch_obj])
+        except Exception as exc:
+            print(f"\033[1;31m[LMS Ingest Error]\033[0m Could not store synced punch in Postgres: {exc}")
+
+    if new_added > 0:
+        try:
+            with open(LOGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(PUNCH_LOGS[:2000], f, indent=2, default=str)
+        except Exception:
+            pass
 
     return JSONResponse(status_code=200, content={
         "ok": True,
@@ -906,6 +937,13 @@ async def getrequest_handler(request: Request) -> PlainTextResponse:
     # and a dead one are indistinguishable by punches alone.
     sn = get_query_param_ci(request, "SN")
     mark_seen(sn, request)
+
+    clean_sn = str(sn or "").strip().upper()
+    if clean_sn and clean_sn in DEVICE_COMMAND_QUEUE and DEVICE_COMMAND_QUEUE[clean_sn]:
+        cmd = DEVICE_COMMAND_QUEUE[clean_sn].pop(0)
+        print(f"\033[1;32m[Push Command Dispatched]\033[0m Machine: {clean_sn} -> {cmd}")
+        return PlainTextResponse(cmd, media_type="text/plain")
+
     return PlainTextResponse("OK", media_type="text/plain")
 
 
