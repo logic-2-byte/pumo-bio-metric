@@ -454,6 +454,64 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
     return parsed_records
 
 
+
+def parse_userinfo(body_str: str, sn: str):
+    """Parse pushed user info / name tables from eSSL / ZKTeco hardware."""
+    if not body_str:
+        return
+    updated = 0
+    for line in body_str.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or is_header_or_metadata_line(line):
+            continue
+        pin = None
+        name = None
+        role = "Normal User"
+
+        # Key=Value format: PIN=2\tName=Deepak\tPri=0
+        if "PIN=" in line.upper() or "NAME=" in line.upper():
+            kv = {}
+            for item in line.replace("\t", " ").split():
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    kv[k.strip().upper()] = v.strip()
+            pin = str(kv.get("PIN") or kv.get("USERID") or "")
+            name = kv.get("NAME")
+            try:
+                pri = int(kv.get("PRI") or kv.get("PRIVILEGE") or 0)
+                role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+            except Exception:
+                pass
+        else:
+            # Tab separated: PIN \t Name \t Pass \t Card \t Pri \t Grp
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 2 and parts[0]:
+                pin = str(parts[0])
+                name = parts[1]
+                if len(parts) > 4:
+                    try:
+                        pri = int(parts[4])
+                        role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+                    except Exception:
+                        pass
+
+        if pin and name and not name.startswith("User "):
+            DEVICE_USER_CACHE[pin] = {
+                "name": name,
+                "role": role
+            }
+            # Update any existing logs in memory that were waiting for this name
+            for p in PUNCH_LOGS:
+                if str(p.get("userId", "")).strip() == pin:
+                    p["userName"] = name
+                    p["userRole"] = role
+            updated += 1
+
+    if updated > 0:
+        save_user_cache()
+        print(f"\033[1;32m[Push User Names Captured]\033[0m Learned {updated} user name(s) directly from machine {sn}!")
+
+
 def parse_oplog(body_str: str, sn: str):
     """Parse and log device administration operations (OPLOG / OPERLOG)."""
     if not body_str:
@@ -860,6 +918,8 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # 1.1 Device Handshake / Initialization (GET)
     if request.method == "GET":
         print(f"\n\033[1;32m[iClock Handshake Connected]\033[0m Device SN: \033[1;33m{sn}\033[0m from IP: \033[1;36m{client_ip}\033[0m")
+        # Automatically ask machine to push all user names it has on its screen/hardware
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
         asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         config_response = "\n".join([
@@ -902,6 +962,10 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Route by Table Type
     if "OPERLOG" in effective_table or "OPLOG" in effective_table:
         parse_oplog(body_str, sn)
+        return PlainTextResponse(content="OK", media_type="text/plain")
+
+    if "USERINFO" in effective_table or "USER" in effective_table:
+        parse_userinfo(body_str, sn)
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
