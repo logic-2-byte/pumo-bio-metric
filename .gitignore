@@ -180,9 +180,10 @@ cython_debug/
 # Exclude Certificate files
 ssl/*
 
-# Exclude all text files, Except requirements.txt
+# Exclude all text files, Except requirements.txt and requirements-dev.txt
 *.txt
 !requirements.txt
+!requirements-dev.txt
 !commands.txt
 
 .DS_Store

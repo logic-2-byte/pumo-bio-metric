@@ -1,0 +1,108 @@
+name: Build and Deploy (Dev / Test)
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME_TEST || secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD_TEST || secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            logic2byte/pumo-biometric-server:dev
+            logic2byte/pumo-biometric-server:latest
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Copy docker-compose.prod.yml to Test VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST_TEST || secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER_TEST || secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_TEST || secrets.SSH_PRIVATE_KEY }}
+          source: "docker-compose.prod.yml"
+          target: "~/pumo-biometric-server/"
+
+      - name: Deploy to Test VM
+        uses: appleboy/ssh-action@v1
+        env:
+          ENV_CONTENT: ${{ secrets.ENV_TEST || vars.ENV_TEST || secrets.ENV || vars.ENV }}
+        with:
+          host: ${{ secrets.VM_HOST_TEST || secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER_TEST || secrets.VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY_TEST || secrets.SSH_PRIVATE_KEY }}
+          envs: ENV_CONTENT
+          script: |
+            mkdir -p ~/pumo-biometric-server
+            cd ~/pumo-biometric-server
+
+            echo "Updating docker-compose.yml..."
+            if [ -f "docker-compose.prod.yml" ]; then
+              mv docker-compose.prod.yml docker-compose.yml
+            fi
+
+            echo "Creating .env file..."
+            echo "$ENV_CONTENT" > .env
+            chmod 600 .env
+
+            # The two bind-mounted directories, created with 10001:10001 permissions
+            mkdir -p spool data/logs
+            sudo chown -R 10001:10001 spool data/logs 2>/dev/null \
+              || chown -R 10001:10001 spool data/logs
+
+            # Detect whether VM uses modern 'docker compose' or legacy 'docker-compose'
+            if docker compose version >/dev/null 2>&1; then
+              DC="docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC="docker-compose"
+            else
+              echo "Error: Neither 'docker compose' nor 'docker-compose' found on the host."
+              exit 1
+            fi
+
+            echo "Pulling latest Docker image..."
+            $DC pull
+
+            echo "Starting services..."
+            $DC up -d --force-recreate
+
+            # Health verification
+            echo "Waiting for the service to answer..."
+            for _ in $(seq 1 20); do
+              if $DC exec -T app python -c \
+                   "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/pulse', timeout=5).status==200 else 1)" \
+                   >/dev/null 2>&1; then
+                echo "Biometric bridge is up."
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "::error::The biometric bridge did not answer within 100s."
+            $DC ps
+            $DC logs --tail=200 app
+            exit 1

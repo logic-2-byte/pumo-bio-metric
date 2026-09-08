@@ -5,7 +5,6 @@ The bridge that actually moves punches into the LMS is started by the lifespan
 in `app.core.manager`; see `app.sync` for what it does.
 """
 
-from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -16,8 +15,10 @@ from app.core.logger import setup_logger
 from app.core.manager import lifespan
 from app.core.settings import Settings
 from app.router.base import router as base_router
+from app.router.employees import router as employees_router
 from app.router.iclock import get_local_ips
 from app.router.iclock import router as iclock_router
+from app.router.migration import router as migration_router
 
 _settings = Settings()
 
@@ -41,7 +42,7 @@ async def log_incoming_requests(request: Request, call_next):
     path = request.url.path
     # The SSE stream and the dashboard's own polling would otherwise fill the
     # terminal and bury the punch banners, which are the useful output.
-    if not path.startswith(("/events", "/api/punches", "/favicon.ico")):
+    if not path.startswith(("/events", "/api/punches", "/favicon.ico", "/api/migration", "/api/employees")):
         client_ip = request.client.host if request.client else "unknown"
         query = f"?{request.url.query}" if request.url.query else ""
         print(f"\033[1;90m[HTTP {request.method}]\033[0m "
@@ -51,9 +52,10 @@ async def log_incoming_requests(request: Request, call_next):
 
 app.include_router(base_router)
 app.include_router(iclock_router)
+app.include_router(migration_router)
+app.include_router(employees_router)
 
 
-@lru_cache(maxsize=1)
 def _dashboard_template() -> str:
     """
     The dashboard markup, read once.

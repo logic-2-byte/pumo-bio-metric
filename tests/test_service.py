@@ -43,7 +43,7 @@ def test_punch_survives_the_spool_unchanged() -> None:
     The spool is the last copy of a pushed punch before it reaches the LMS, so
     a lossy round-trip here is attendance quietly disappearing.
     """
-    punch = Punch("IP:192.168.0.210", "102", datetime(2026, 8, 15, 22, 12, 5),
+    punch = Punch("IP:192.168.1.209", "102", datetime(2026, 8, 15, 22, 12, 5),
                   punch_state=0, verify_mode=1, work_code="0",
                   device_user_name="Gowtham")
     assert Punch.from_json(punch.to_json()) == punch

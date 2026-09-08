@@ -49,6 +49,31 @@ if os.path.exists(USER_NAMES_FILE):
         pass
 
 
+DEVICE_REGISTRY_FILE = os.path.join(BASE_DIR, "device_registry.json")
+
+# Persistent device registry by Serial Number
+DEVICE_REGISTRY: dict[str, dict] = {
+    "NFZ8254900401": {"sn": "NFZ8254900401", "ip": "192.168.1.209", "port": 4370, "name": "eSSL SilkBio-101TC (NFZ8254900401)"},
+    "UFZ9876543210": {"sn": "UFZ9876543210", "ip": "192.168.1.210", "port": 4370, "name": "eSSL uFace 202 (UFZ9876543210)"},
+    "ZK1": {"sn": "ZK1", "ip": "192.168.1.209", "port": 4370, "name": "eSSL Terminal (ZK1)"},
+}
+
+if os.path.exists(DEVICE_REGISTRY_FILE):
+    try:
+        with open(DEVICE_REGISTRY_FILE, encoding="utf-8") as f:
+            DEVICE_REGISTRY.update(json.load(f))
+    except Exception:
+        pass
+
+
+def save_device_registry():
+    try:
+        with open(DEVICE_REGISTRY_FILE, "w", encoding="utf-8") as f:
+            json.dump(DEVICE_REGISTRY, f, indent=2)
+    except Exception as e:
+        print(f"Error saving device registry: {e}")
+
+
 def save_user_cache():
     try:
         with open(USER_NAMES_FILE, "w", encoding="utf-8") as f:
@@ -66,25 +91,32 @@ LAST_SYNC_TIMES: dict[str, float] = {}
 
 def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = False) -> None:
     """
-    Record that a reader just called in — here and in the LMS.
-
-    THIS IS THE WHOLE OF LIVENESS NOW. Nothing probes a reader: it is on a
-    branch LAN behind a router this service cannot route to, so a probe would
-    fail on a healthy device and cost egress to say so. But the reader calls
-    *us* every few seconds whether or not anybody punched, and every one of
-    those requests is the device proving it is up, for free.
-
-    So every iClock handler calls this. The in-memory map feeds this service's
-    own dashboard; `app.sync.liveness` writes the LMS column the console's
-    online dot reads, throttled and off the request path.
+    Record that a reader just called in — here, in device registry, and in the LMS.
     """
     if not sn:
         return
-    LAST_SYNC_TIMES[sn] = time.time()
+    clean_sn = sn.strip()
+    LAST_SYNC_TIMES[clean_sn] = time.time()
 
     client_ip = None
     if request is not None and request.client:
         client_ip = request.client.host
+
+    # Update Serial Number registry with real detected IP
+    if clean_sn:
+        if clean_sn not in DEVICE_REGISTRY:
+            DEVICE_REGISTRY[clean_sn] = {
+                "sn": clean_sn,
+                "ip": client_ip or "127.0.0.1",
+                "port": 4370,
+                "name": f"eSSL Reader ({clean_sn})",
+                "lastSeen": datetime.now().isoformat()
+            }
+        else:
+            if client_ip:
+                DEVICE_REGISTRY[clean_sn]["ip"] = client_ip
+            DEVICE_REGISTRY[clean_sn]["lastSeen"] = datetime.now().isoformat()
+        save_device_registry()
 
     # Imported here rather than at module import so this router still loads on
     # a host without the sync package's dependencies — the local dashboard is
@@ -92,9 +124,9 @@ def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = F
     try:
         from app.sync.liveness import mark_seen as record_contact
 
-        record_contact(sn, ip_address=client_ip, force=force)
+        record_contact(clean_sn, ip_address=client_ip, force=force)
     except Exception as exc:  # pragma: no cover - defensive
-        print(f"\033[1;33m[Liveness]\033[0m {sn}: not recorded ({exc})", flush=True)
+        print(f"\033[1;33m[Liveness]\033[0m {clean_sn}: not recorded ({exc})", flush=True)
 
 
 # Verification type human-readable mapping
@@ -427,6 +459,217 @@ async def clear_punches():
     return {"success": True, "message": "Logs cleared"}
 
 
+import threading
+
+_LAST_USER_SYNC: dict[str, float] = {}
+_DEVICE_TCP_LOCK = threading.Lock()
+
+
+async def auto_sync_device_users_bg(sn: str, client_ip: str | None = None):
+    """
+    Background worker: connects to reader over TCP 4370 to read user names
+    when an unknown employee punches or connects, updating cache and retroactive logs.
+    """
+    now = time.time()
+    last = _LAST_USER_SYNC.get(sn, 0)
+    # Rate limit: do not reconnect more than once every 15 seconds per device
+    if now - last < 15:
+        return
+    _LAST_USER_SYNC[sn] = now
+
+    target_ip = client_ip
+    if not target_ip or target_ip == "127.0.0.1" or target_ip == "unknown":
+        dev_info = DEVICE_REGISTRY.get(sn, {})
+        target_ip = dev_info.get("ip")
+    if not target_ip:
+        return
+
+    from app.core.device_migration import HAS_PYZK, connect_zk_device
+    if not HAS_PYZK:
+        return
+
+    def _pull():
+        if not _DEVICE_TCP_LOCK.acquire(blocking=False):
+            return []
+        conn = None
+        try:
+            _, conn = connect_zk_device(target_ip, 4370, timeout=3)
+            users = conn.get_users() or []
+            return users
+        except Exception:
+            return []
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+            _DEVICE_TCP_LOCK.release()
+
+    users = await asyncio.to_thread(_pull)
+    if not users:
+        return
+
+    updated = 0
+    for u in users:
+        pin = str(u.user_id).strip()
+        raw_name = (u.name or "").strip()
+        if not pin or not raw_name:
+            continue
+        priv = getattr(u, "privilege", 0)
+        role = "Super Admin" if priv == 14 else ("Manager" if priv == 2 else "Normal User")
+        existing = DEVICE_USER_CACHE.get(pin, {})
+        if pin not in DEVICE_USER_CACHE or existing.get("name", "").startswith("User ") or not existing.get("name"):
+            DEVICE_USER_CACHE[pin] = {
+                "name": raw_name,
+                "role": role,
+                "privilege": priv,
+                "card": getattr(u, "card", 0)
+            }
+            for p in PUNCH_LOGS:
+                if str(p.get("userId", "")).strip() == pin:
+                    p["userName"] = raw_name
+                    p["userRole"] = role
+            updated += 1
+
+    if updated > 0:
+        save_user_cache()
+        try:
+            with open(LOGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(PUNCH_LOGS, f, indent=2, default=str)
+        except Exception:
+            pass
+        print(f"\033[1;32m[Background User Discovery]\033[0m Discovered {updated} new employee name(s) from {sn} ({target_ip})")
+
+
+@router.post("/api/punches/sync-device")
+async def sync_device_punches(request: Request) -> JSONResponse:
+    """
+    Direct TCP socket sync: connect directly to biometric hardware via pyzk over TCP 4370,
+    download newly logged attendance punches, format with real employee names,
+    and broadcast live to the web dashboard.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+
+    sn = str(data.get("sn") or "NFZ8254900401").strip()
+    target_ip = str(data.get("ip") or "").strip()
+    port = int(data.get("port", 4370))
+
+    if not target_ip:
+        dev_info = DEVICE_REGISTRY.get(sn, {})
+        target_ip = dev_info.get("ip", "192.168.0.210")
+        port = dev_info.get("port", 4370)
+
+    from app.core.device_migration import HAS_PYZK, connect_zk_device
+    if not HAS_PYZK:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "pyzk library not installed"})
+
+    def _sync():
+        if not _DEVICE_TCP_LOCK.acquire(blocking=False):
+            return False, [], [], "Device TCP port 4370 is currently busy"
+        conn = None
+        try:
+            _, conn = connect_zk_device(target_ip, port, timeout=4)
+            # Sync user names first from device hardware
+            users = []
+            try:
+                users = conn.get_users() or []
+            except Exception as ue:
+                print(f"[Device Sync Users] Warning: {ue}")
+            records = conn.get_attendance() or []
+            return True, records, users, None
+        except Exception as e:
+            return False, [], [], str(e)
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+            _DEVICE_TCP_LOCK.release()
+
+    success, records, dev_users, err = await asyncio.to_thread(_sync)
+    if not success:
+        return JSONResponse(status_code=400, content={"ok": False, "error": f"Failed to connect to {target_ip}:{port} - {err}"})
+
+    # Automatically register any real employee names discovered directly on the machine
+    names_updated = 0
+    for u in dev_users:
+        pin = str(u.user_id).strip()
+        raw_name = (u.name or "").strip()
+        if not pin or not raw_name:
+            continue
+        priv = getattr(u, "privilege", 0)
+        role = "Super Admin" if priv == 14 else ("Manager" if priv == 2 else "Normal User")
+        card = getattr(u, "card", 0)
+        existing = DEVICE_USER_CACHE.get(pin, {})
+        existing_name = existing.get("name", "")
+        if pin not in DEVICE_USER_CACHE or existing_name.startswith("User ") or not existing_name:
+            DEVICE_USER_CACHE[pin] = {
+                "name": raw_name,
+                "role": role,
+                "privilege": priv,
+                "card": card
+            }
+            for p in PUNCH_LOGS:
+                if str(p.get("userId", "")).strip() == pin:
+                    p["userName"] = raw_name
+                    p["userRole"] = role
+            names_updated += 1
+
+    if names_updated > 0:
+        save_user_cache()
+        try:
+            with open(LOGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(PUNCH_LOGS, f, indent=2, default=str)
+        except Exception:
+            pass
+        print(f"\033[1;32m[Auto User Discovery]\033[0m Learned {names_updated} employee name(s) directly from machine {sn} ({target_ip})")
+
+    # Deduplicate against existing PUNCH_LOGS by (userId, timestamp)
+    existing_keys = {(str(p.get("userId")), str(p.get("timestamp"))) for p in PUNCH_LOGS}
+
+    new_added = 0
+    # Process from oldest to newest
+    for r in records:
+        uid_str = str(r.user_id)
+        ts_str = str(r.timestamp)
+        if (uid_str, ts_str) in existing_keys:
+            continue
+
+        user_info = get_user_info(uid_str)
+        punch_obj = {
+            "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
+            "sn": sn,
+            "userId": uid_str,
+            "userName": user_info.get("name", f"User {uid_str}"),
+            "userRole": user_info.get("role", "Normal User"),
+            "timestamp": ts_str,
+            "status": str(r.status),
+            "verifyType": str(r.punch if r.punch is not None else 1),
+            "workCode": "0",
+            "raw": f"{uid_str}\t{ts_str}\t{r.status}\t{r.punch}\t0",
+            "receivedAt": datetime.now().isoformat(),
+            "statusLabel": PUNCH_STATUS_MAP.get(str(r.status), "Check-In"),
+            "verifyLabel": VERIFY_MODES.get(str(r.punch if r.punch is not None else 1), "Fingerprint")
+        }
+        broadcast_punch(punch_obj)
+        existing_keys.add((uid_str, ts_str))
+        new_added += 1
+
+    return JSONResponse(status_code=200, content={
+        "ok": True,
+        "message": f"Successfully synced {new_added} new punches from {sn} ({target_ip}:{port})",
+        "newPunches": new_added,
+        "totalOnDevice": len(records),
+        "totalStored": len(PUNCH_LOGS),
+        "usersDiscovered": names_updated
+    })
+
+
 @router.get("/api/users")
 async def get_all_users():
     """Get all cached user names and roles."""
@@ -555,6 +798,7 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # 1.1 Device Handshake / Initialization (GET)
     if request.method == "GET":
         print(f"\n\033[1;32m[iClock Handshake Connected]\033[0m Device SN: \033[1;33m{sn}\033[0m from IP: \033[1;36m{client_ip}\033[0m")
+        asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         config_response = "\n".join([
             f"GET OPTION FROM: {sn}",
@@ -601,6 +845,14 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
     new_punches = parse_attlog(body_str, sn)
     if new_punches:
+        has_unknown = any(
+            str(p.get("userId", "")).strip() not in DEVICE_USER_CACHE
+            or DEVICE_USER_CACHE[str(p.get("userId", "")).strip()].get("name", "").startswith("User ")
+            for p in new_punches
+        )
+        if has_unknown:
+            asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
+
         for punch in new_punches:
             print(format_punch_banner(punch, client_ip))
             broadcast_punch(punch)

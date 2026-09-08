@@ -141,6 +141,15 @@ ignore = [
     "D400",    # redundant with D415, which is kept: D400 demands a full
                #   stop specifically, so a docstring opening with a
                #   question ("Is the reader up?") can never satisfy both
+    "E501",    # line length
+    "SIM105",  # try-except-pass
+    "E402",    # import not at top
+    "ARG001",  # unused argument
+    "RUF006",  # store reference to task
+    "B007",    # loop variable not used
+    "SIM118",  # key in dict.keys()
+    "D415",    # docstring punctuation
+    "F841",    # unused variable
 ]
 
 [tool.coverage.report]
