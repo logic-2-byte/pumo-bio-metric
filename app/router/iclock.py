@@ -203,11 +203,43 @@ def get_local_ips() -> list[str]:
 
 
 def get_user_info(user_id: str) -> dict:
-    """Helper: Get user info from cache or return default."""
+    """Helper: Get user info from local cache, or query LMS Postgres database for real staff name."""
     u_id = str(user_id).strip()
     if u_id in DEVICE_USER_CACHE:
-        return DEVICE_USER_CACHE[u_id]
-    return {"name": f"User {u_id}", "role": "Normal User"}
+        cached = DEVICE_USER_CACHE[u_id]
+        if cached.get("name") and not cached["name"].startswith("User "):
+            return cached
+
+    # Query LMS PostgreSQL for the mapped staff member's real name
+    try:
+        from app.sync.config import config
+        from app.sync.lms_db import LmsDatabase
+        db = LmsDatabase(config)
+        with db._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.first_name, s.last_name, s.designation, s.role
+                FROM biometric_enrollments be
+                JOIN staff s ON be.staff_id = s.id
+                WHERE be.device_user_id = %s AND be.ignored = false
+                LIMIT 1
+            """, (u_id,))
+            row = cur.fetchone()
+            if row:
+                first, last, desig, role = row
+                full_name = f"{first or ''} {last or ''}".strip()
+                if full_name:
+                    info = {
+                        "name": full_name,
+                        "role": desig or role or "Staff",
+                        "designation": desig or ""
+                    }
+                    DEVICE_USER_CACHE[u_id] = info
+                    save_user_cache()
+                    return info
+    except Exception:
+        pass
+
+    return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
 
 
 def format_punch_banner(punch: dict, client_ip: str = "") -> str:
