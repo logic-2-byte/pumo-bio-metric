@@ -210,12 +210,26 @@ def get_user_info(user_id: str) -> dict:
         if cached.get("name") and not cached["name"].startswith("User "):
             return cached
 
-    # Query LMS PostgreSQL for the mapped staff member's real name
+    # Query LMS PostgreSQL: first biometric_device_users, then mapped staff member
     try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
+            # 1. Check persistent biometric_device_users table
+            cur.execute("""
+                SELECT name, role FROM biometric_device_users 
+                WHERE device_user_id = %s 
+                ORDER BY updated_at DESC LIMIT 1
+            """, (u_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                info = {"name": row[0].strip(), "role": row[1] or "Normal User"}
+                DEVICE_USER_CACHE[u_id] = info
+                save_user_cache()
+                return info
+
+            # 2. Check mapped staff member
             cur.execute("""
                 SELECT s.name, s.designation
                 FROM biometric_enrollments be
@@ -224,17 +238,15 @@ def get_user_info(user_id: str) -> dict:
                 LIMIT 1
             """, (u_id,))
             row = cur.fetchone()
-            if row:
-                st_name, desig = row
-                if st_name:
-                    info = {
-                        "name": st_name.strip(),
-                        "role": desig or "Staff",
-                        "designation": desig or ""
-                    }
-                    DEVICE_USER_CACHE[u_id] = info
-                    save_user_cache()
-                    return info
+            if row and row[0]:
+                info = {
+                    "name": row[0].strip(),
+                    "role": row[1] or "Staff",
+                    "designation": row[1] or ""
+                }
+                DEVICE_USER_CACHE[u_id] = info
+                save_user_cache()
+                return info
     except Exception:
         pass
 
