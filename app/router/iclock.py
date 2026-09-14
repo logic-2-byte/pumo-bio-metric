@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import secrets
 import socket
 import time
@@ -762,6 +763,19 @@ def parse_userinfo(body_str: str, sn: str):
                 if "=" in item:
                     k, v = item.split("=", 1)
                     kv[k.strip().upper()] = v.strip().strip('"')
+            # Some eSSL devices wrap USERINFO inside OPERLOG and use spaces
+            # rather than tabs. Preserve a multi-word Name until the next key.
+            if "\t" not in line:
+                pin_match = re.search(r"(?:^|\s)PIN=([^\s]+)", line, re.IGNORECASE)
+                name_match = re.search(
+                    r"(?:^|\s)NAME=(.*?)(?=\s+(?:PRI|PRIVILEGE|CARD|PASSWD|PASSWORD|GRP)=|$)",
+                    line,
+                    re.IGNORECASE,
+                )
+                if pin_match:
+                    kv["PIN"] = pin_match.group(1).strip()
+                if name_match:
+                    kv["NAME"] = name_match.group(1).strip().strip('"')
             pin = str(kv.get("PIN") or kv.get("USERID") or "")
             name = kv.get("NAME")
             try:
@@ -809,10 +823,17 @@ def parse_userinfo(body_str: str, sn: str):
 def parse_oplog(body_str: str, sn: str):
     """Parse and log device administration operations (OPLOG / OPERLOG)."""
     if not body_str:
-        return
+        return 0
+    discovered = 0
     lines = [line.strip() for line in body_str.replace("\r", "\n").split("\n") if line.strip()]
     for line in lines:
         if is_header_or_metadata_line(line):
+            continue
+        # NFZ/eSSL firmware may return USERINFO data under table=OPERLOG, for
+        # example: "USER PIN=1 Name=Admin Pri=14". It is profile data, not an
+        # administrator action, and must feed the ADMS user scan.
+        if "PIN=" in line.upper() and "NAME=" in line.upper():
+            discovered += parse_userinfo(line, sn)
             continue
         parts = line.split("\t")
         if len(parts) >= 3:
@@ -824,6 +845,7 @@ def parse_oplog(body_str: str, sn: str):
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Admin: {op_name} (ID: {operator_pin}) | OpType: {op_type} | Time: {op_time}")
         else:
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Raw: {line}")
+    return discovered
 
 
 def get_query_param_ci(request: Request, key: str, default: str | None = None) -> str | None:
@@ -1298,9 +1320,11 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
 
     # Route by Table Type
     if "OPERLOG" in effective_table or "OPLOG" in effective_table:
-        parse_oplog(body_str, sn)
+        discovered = parse_oplog(body_str, sn)
+        record_import_users(sn, discovered)
         # Any admin action on device (adding user, finger, card, etc.) -> query userinfo to learn real names
-        queue_device_cmd(sn, "DATA QUERY USERINFO")
+        if not discovered:
+            queue_device_cmd(sn, "DATA QUERY USERINFO")
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     if "USERINFO" in effective_table or "USER" in effective_table:

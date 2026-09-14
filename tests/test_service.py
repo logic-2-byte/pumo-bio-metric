@@ -139,6 +139,19 @@ def test_userinfo_keeps_excel_name_with_spaces(monkeypatch) -> None:
     assert iclock.DEVICE_USER_CACHE["550"]["name"] == "Deepak Kumar"
 
 
+def test_operlog_user_profile_is_saved_as_adms_user(monkeypatch) -> None:
+    """NFZ firmware can return USERINFO rows under the OPERLOG table."""
+    monkeypatch.setattr(iclock, "save_device_user_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(iclock, "save_user_cache", lambda: None)
+    iclock.DEVICE_USER_CACHE.pop("007", None)
+
+    discovered = iclock.parse_oplog("USER PIN=007 Name=Gowtham Test Pri=0", "ZK1")
+
+    assert discovered == 1
+    assert iclock.DEVICE_USER_CACHE["007"]["name"] == "Gowtham Test"
+    assert iclock.DEVICE_USER_CACHE["007"]["deviceSerial"] == "ZK1"
+
+
 # ----------------------------------------------------------------------
 # The ADMS endpoints
 # ----------------------------------------------------------------------
