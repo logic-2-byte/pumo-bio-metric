@@ -412,10 +412,11 @@ def probe_device_connection(device_id: str, port: int = 4370, timeout: int = 5, 
         # address can be NATed and TCP/4370 often remains closed while the
         # reader is online and processing queued ADMS commands.
         try:
-            from app.router.iclock import adms_last_seen
+            from app.router.iclock import adms_last_seen, get_adms_device_users
             seen_at = adms_last_seen(target_sn)
             if seen_at:
                 from datetime import datetime
+                users = get_adms_device_users(target_sn)
                 return {
                     "ok": True,
                     "simulated": False,
@@ -424,6 +425,11 @@ def probe_device_connection(device_id: str, port: int = 4370, timeout: int = 5, 
                     "ip": target_ip,
                     "port": target_port,
                     "serialNumber": target_sn,
+                    "deviceName": target_name,
+                    "userCount": len(users),
+                    "fingerCount": None,
+                    "fpVersion": "ADMS",
+                    "platform": "ADMS Push",
                     "lastSeen": datetime.fromtimestamp(seen_at).isoformat(),
                     "message": (
                         "Device is online through ADMS push; direct TCP port 4370 "
@@ -492,12 +498,22 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
     # us, scanning users must use the users it pushed to ADMS rather than wait
     # for an unreachable reverse TCP/4370 connection.
     try:
-        from app.router.iclock import adms_last_seen, get_adms_device_users, queue_device_cmd
+        from app.router.iclock import (
+            COMMAND_TRACKING, adms_last_seen, get_adms_device_users, queue_device_cmd,
+        )
         if adms_last_seen(target_sn):
             users_list = get_adms_device_users(target_sn)
             refresh_command = None
             if not users_list:
-                refresh_command = queue_device_cmd(target_sn, "DATA QUERY USERINFO")
+                refresh_in_flight = any(
+                    command.get("sn") == target_sn
+                    and command.get("action") == "command"
+                    and command.get("command") == "DATA QUERY USERINFO"
+                    and command.get("status") in {"queued", "dispatched"}
+                    for command in COMMAND_TRACKING.values()
+                )
+                if not refresh_in_flight:
+                    refresh_command = queue_device_cmd(target_sn, "DATA QUERY USERINFO")
             return {
                 "ok": True,
                 "simulated": False,
@@ -508,6 +524,7 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
                 "count": len(users_list),
                 "users": users_list,
                 "refreshQueued": bool(refresh_command),
+                "userRefreshPending": not users_list,
                 "message": (
                     f"User refresh queued ({refresh_command}); scan again after the device polls ADMS."
                     if refresh_command else

@@ -1616,13 +1616,18 @@
         const data = await resp.json();
 
         if (data.ok) {
+          const admsDetails = data.mode === 'adms';
+          const deviceName = data.deviceName || (admsDetails ? 'ADMS Push Device' : 'Unknown Device');
+          const fpVersion = data.fpVersion || (admsDetails ? 'ADMS / unavailable' : 'Unknown');
+          const userCount = data.userCount ?? (admsDetails ? 'loading' : 0);
+          const fingerCount = data.fingerCount ?? 'unavailable via ADMS';
           badge.className = 'device-status-badge status-ok';
           badge.innerText = 'Connected ✅';
           specs.innerHTML = `
-            <strong>${data.deviceName}</strong> (SN: <span style="color: var(--accent);">${data.serialNumber}</span>)<br>
-            Users: <strong>${data.userCount}</strong> | Fingers: <strong>${data.fingerCount}</strong> | ZKFP: <strong>v${data.fpVersion}</strong>
+            <strong>${deviceName}</strong> (SN: <span style="color: var(--accent);">${data.serialNumber}</span>)<br>
+            Users: <strong>${userCount}</strong> | Fingers: <strong>${fingerCount}</strong> | ZKFP: <strong>${fpVersion}</strong>
           `;
-          logTerminal(`Connected to ${type.toUpperCase()} (Device SN: ${data.serialNumber}, Name: ${data.deviceName}, FP: v${data.fpVersion})`, 'log-success');
+          logTerminal(`Connected to ${type.toUpperCase()} (Device SN: ${data.serialNumber}, Name: ${deviceName}, FP: ${fpVersion})`, 'log-success');
         } else {
           badge.className = 'device-status-badge status-err';
           badge.innerText = 'Failed ❌';
@@ -1654,7 +1659,12 @@
         });
         const data = await resp.json();
 
-        if (data.ok && data.users) {
+        if (data.ok && data.userRefreshPending) {
+          sourceUsers = [];
+          document.getElementById('source-user-count').innerText = '0';
+          tbody.innerHTML = '<tr><td colspan="7" class="empty-state">Device user list requested through ADMS. Wait for the device to poll and upload USERINFO, then scan again.</td></tr>';
+          logTerminal(data.message || `Waiting for USERINFO upload from Source Device (SN: ${sn})...`, 'log-warn');
+        } else if (data.ok && data.users) {
           sourceUsers = data.users;
           document.getElementById('source-user-count').innerText = sourceUsers.length;
           renderSourceUsers();
