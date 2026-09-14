@@ -408,6 +408,32 @@ def probe_device_connection(device_id: str, port: int = 4370, timeout: int = 5, 
             "message": f"Connected successfully to {device_name} ({sn})"
         }
     except Exception as e:
+        # ADMS readers initiate their connection to us. Their public/source
+        # address can be NATed and TCP/4370 often remains closed while the
+        # reader is online and processing queued ADMS commands.
+        try:
+            from app.router.iclock import adms_last_seen
+            seen_at = adms_last_seen(target_sn)
+            if seen_at:
+                from datetime import datetime
+                return {
+                    "ok": True,
+                    "simulated": False,
+                    "mode": "adms",
+                    "directTcp": False,
+                    "ip": target_ip,
+                    "port": target_port,
+                    "serialNumber": target_sn,
+                    "lastSeen": datetime.fromtimestamp(seen_at).isoformat(),
+                    "message": (
+                        "Device is online through ADMS push; direct TCP port 4370 "
+                        "is not reachable from this server. Use queued ADMS commands "
+                        "for user changes."
+                    ),
+                }
+        except Exception:
+            # A failed liveness lookup must never hide the original TCP error.
+            pass
         return {
             "ok": False,
             "simulated": False,

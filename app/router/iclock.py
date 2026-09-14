@@ -104,6 +104,21 @@ SSE_SUBSCRIBERS: list[asyncio.Queue] = []
 # Global cache for device sync times, for this service's own dashboard.
 LAST_SYNC_TIMES: dict[str, float] = {}
 
+# A reader configured for ADMS pushes requests *to this service*. Such a reader
+# commonly sits behind NAT or a firewall, so TCP port 4370 need not be reachable
+# in the reverse direction. This is intentionally a short-lived signal.
+ADMS_ONLINE_WINDOW_SECONDS = 15 * 60
+
+
+def adms_last_seen(sn: str | None) -> float | None:
+    """Return a fresh in-process ADMS heartbeat time for the device."""
+    if not sn:
+        return None
+    seen_at = LAST_SYNC_TIMES.get(str(sn).strip())
+    if seen_at and time.time() - seen_at <= ADMS_ONLINE_WINDOW_SECONDS:
+        return seen_at
+    return None
+
 
 def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = False) -> None:
     """
@@ -641,6 +656,25 @@ async def sync_device_punches(request: Request) -> JSONResponse:
 
     success, records, dev_users, err = await asyncio.to_thread(_sync)
     if not success:
+        # A reader actively posting to ADMS is syncing inbound attendance and
+        # commands already. Do not show an unreachable reverse TCP connection
+        # as an overall sync failure.
+        seen_at = adms_last_seen(sn)
+        if seen_at:
+            return JSONResponse(status_code=200, content={
+                "ok": True,
+                "mode": "adms",
+                "directTcp": False,
+                "serialNumber": sn,
+                "ip": target_ip,
+                "port": port,
+                "lastSeen": datetime.fromtimestamp(seen_at).isoformat(),
+                "message": (
+                    "Device is online through ADMS push. Attendance and queued "
+                    "commands sync when the device polls the server; direct TCP "
+                    "port 4370 is not reachable from this server."
+                ),
+            })
         return JSONResponse(status_code=400, content={"ok": False, "error": f"Failed to connect to {target_ip}:{port} - {err}"})
 
     # Automatically register any real employee names discovered directly on the machine

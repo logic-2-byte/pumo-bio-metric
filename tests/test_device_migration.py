@@ -33,6 +33,26 @@ def test_device_connection_probe():
     assert "serialNumber" in res
 
 
+def test_adms_device_probe_succeeds_when_reverse_tcp_is_unreachable(monkeypatch):
+    """An active ADMS reader must not be reported offline just because 4370 is closed."""
+    import time
+    from app.core import device_migration
+    from app.router import iclock
+
+    def blocked_tcp(*_args, **_kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(device_migration, "HAS_PYZK", True)
+    monkeypatch.setattr(device_migration, "connect_zk_device", blocked_tcp)
+    iclock.LAST_SYNC_TIMES["NFZ8254900401"] = time.time()
+
+    res = probe_device_connection("NFZ8254900401")
+
+    assert res["ok"] is True
+    assert res["mode"] == "adms"
+    assert res["directTcp"] is False
+
+
 def test_fetch_device_users():
     """Listing users returns accurate counts of users and enrolled fingers with real names."""
     res = fetch_device_users("192.168.1.209", 4370, simulate=True)

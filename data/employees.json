@@ -6,18 +6,7 @@
     "role": "Normal User",
     "branchId": 2,
     "department": "Engineering",
-    "access": [
-      {
-        "deviceSn": "NFZ8254900401",
-        "pin": "101",
-        "primary": true
-      },
-      {
-        "deviceSn": "UFZ9876543210",
-        "pin": "101",
-        "primary": false
-      }
-    ],
+    "access": [],
     "transferHistory": [
       {
         "fromBranchId": 1,
@@ -29,6 +18,33 @@
         "biometricTransferred": true,
         "biometricMode": "copy",
         "biometricOk": true
+      }
+    ],
+    "status": "Terminated",
+    "terminatedDate": "2026-09-14",
+    "offboardHistory": [
+      {
+        "timestamp": "2026-09-14",
+        "action": "fire_all",
+        "deleteMode": "full",
+        "deviceResults": [
+          {
+            "deviceSn": "NFZ8254900401",
+            "pin": "101",
+            "ok": true,
+            "deleted": true,
+            "message": "User 101 and all biometric templates deleted successfully from simulated device NFZ8254900401.",
+            "simulated": true
+          },
+          {
+            "deviceSn": "UFZ9876543210",
+            "pin": "101",
+            "ok": true,
+            "deleted": false,
+            "message": "User 101 not found on simulated device UFZ9876543210.",
+            "simulated": true
+          }
+        ]
       }
     ]
   },
