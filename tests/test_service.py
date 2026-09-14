@@ -25,6 +25,7 @@ from fastapi import status
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.router import iclock
 from app.sync.models import Punch
 from app.sync.push_ingest import to_punch
 from app.sync.spool import PunchSpool
@@ -125,6 +126,17 @@ def test_unusable_rows_are_skipped_not_stored() -> None:
     assert to_punch({"userId": "", "timestamp": "2026-08-15 22:12:05"}) is None
     assert to_punch({"userId": "102", "timestamp": "not a time"}) is None
     assert to_punch({"userId": "102"}) is None
+
+
+def test_userinfo_keeps_excel_name_with_spaces(monkeypatch) -> None:
+    """eSSL USERINFO exports use tabs and names commonly contain spaces."""
+    monkeypatch.setattr(iclock, "save_device_user_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(iclock, "save_user_cache", lambda: None)
+    iclock.DEVICE_USER_CACHE.pop("550", None)
+
+    iclock.parse_userinfo("PIN=550\tName=Deepak Kumar\tPri=0\tCard=0", "ZK1")
+
+    assert iclock.DEVICE_USER_CACHE["550"]["name"] == "Deepak Kumar"
 
 
 # ----------------------------------------------------------------------

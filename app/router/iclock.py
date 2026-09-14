@@ -5,7 +5,7 @@ import secrets
 import socket
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -18,6 +18,7 @@ router = APIRouter(tags=["iclock"])
 DEVICE_COMMAND_QUEUE: dict[str, list[str]] = {}
 _DEVICE_CMD_COUNTER: int = 1000
 
+
 def queue_device_cmd(sn: str, cmd_body: str) -> str:
     """Queue an ADMS command to be dispatched on the device's next /iclock/getrequest poll."""
     global _DEVICE_CMD_COUNTER
@@ -27,6 +28,7 @@ def queue_device_cmd(sn: str, cmd_body: str) -> str:
     DEVICE_COMMAND_QUEUE.setdefault(clean_sn, []).append(cmd_str)
     print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str}")
     return cmd_str
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 LOGS_FILE = os.path.join(BASE_DIR, "attendance_logs.json")
@@ -40,6 +42,33 @@ if os.path.exists(LOGS_FILE):
             PUNCH_LOGS = json.load(f)
     except Exception:
         PUNCH_LOGS = []
+
+HISTORY_DAYS = 30
+
+
+def _log_timestamp(punch: dict) -> datetime | None:
+    raw = str(punch.get("timestamp") or "").strip()
+    if not raw:
+        return None
+    for value in (raw, raw.replace("/", "-")):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return None
+
+
+def prune_punch_logs(days: int = HISTORY_DAYS) -> None:
+    """Keep the complete requested history window instead of an arbitrary row count."""
+    cutoff = datetime.now() - timedelta(days=max(1, days))
+    PUNCH_LOGS[:] = [
+        punch for punch in PUNCH_LOGS
+        if (when := _log_timestamp(punch)) is None or when >= cutoff
+    ]
+    PUNCH_LOGS.sort(key=lambda punch: _log_timestamp(punch) or datetime.min, reverse=True)
+
+
+prune_punch_logs()
 
 # Persistent custom user names store
 DEVICE_USER_CACHE: dict[str, dict] = {
@@ -111,7 +140,7 @@ def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = F
     """
     if not sn:
         return
-    clean_sn = sn.strip()
+    clean_sn = sn.strip().upper()
     LAST_SYNC_TIMES[clean_sn] = time.time()
 
     client_ip = None
@@ -210,36 +239,86 @@ def get_user_info(user_id: str) -> dict:
         if cached.get("name") and not cached["name"].startswith("User "):
             return cached
 
-    # Query LMS PostgreSQL for the mapped staff member's real name
+    # Query LMS PostgreSQL: first biometric_device_users, then mapped staff member
     try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
+            # 1. Check persistent biometric_device_users table
             cur.execute("""
-                SELECT s.first_name, s.last_name, s.designation, s.role
+                SELECT name, role FROM biometric_device_users
+                WHERE device_user_id = %s
+                ORDER BY updated_at DESC LIMIT 1
+            """, (u_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                info = {"name": row[0].strip(), "role": row[1] or "Normal User"}
+                DEVICE_USER_CACHE[u_id] = info
+                save_user_cache()
+                return info
+
+            # 2. Check mapped staff member
+            cur.execute("""
+                SELECT s.name, s.designation
                 FROM biometric_enrollments be
                 JOIN staff s ON be.staff_id = s.id
                 WHERE be.device_user_id = %s AND be.ignored = false
                 LIMIT 1
             """, (u_id,))
             row = cur.fetchone()
-            if row:
-                first, last, desig, role = row
-                full_name = f"{first or ''} {last or ''}".strip()
-                if full_name:
-                    info = {
-                        "name": full_name,
-                        "role": desig or role or "Staff",
-                        "designation": desig or ""
-                    }
-                    DEVICE_USER_CACHE[u_id] = info
-                    save_user_cache()
-                    return info
+            if row and row[0]:
+                info = {
+                    "name": row[0].strip(),
+                    "role": row[1] or "Staff",
+                    "designation": row[1] or ""
+                }
+                DEVICE_USER_CACHE[u_id] = info
+                save_user_cache()
+                return info
     except Exception:
         pass
 
     return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
+
+
+def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None):
+    """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
+    try:
+        from app.sync.config import config
+        from app.sync.lms_db import LmsDatabase
+        clean_pin = str(pin).strip()
+        clean_name = str(name).strip()
+        clean_role = str(role or "Normal User").strip()
+        clean_sn = str(sn or "UNKNOWN").strip().upper()
+        if not clean_pin or not clean_name or clean_name.startswith("User "):
+            return
+
+        db = LmsDatabase(config)
+        with db._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO biometric_device_users (device_serial, device_user_id, name, role, card_no, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (device_serial, device_user_id)
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    role = EXCLUDED.role,
+                    card_no = COALESCE(EXCLUDED.card_no, biometric_device_users.card_no),
+                    updated_at = now();
+            """, (clean_sn, clean_pin, clean_name, clean_role, str(card) if card else None))
+
+            # Also retroactively update punches in biometric_punch_log that were recorded with 'User <pin>' or NULL
+            cur.execute("""
+                UPDATE biometric_punch_log
+                SET user_name = %s
+                WHERE (device_serial = %s OR %s = 'UNKNOWN')
+                  AND device_user_id = %s
+                  AND (user_name IS NULL OR user_name LIKE 'User %%' OR user_name = '');
+            """, (clean_name, clean_sn, clean_sn, clean_pin))
+            conn.commit()
+            print(f"\033[1;32m[DB Sync]\033[0m Persisted user {clean_pin} -> '{clean_name}' ({clean_role}) to biometric_device_users.", flush=True)
+    except Exception as exc:
+        print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
 
 
 def format_punch_banner(punch: dict, client_ip: str = "") -> str:
@@ -293,8 +372,7 @@ def broadcast_punch(punch: dict):
     punch["verifyLabel"] = VERIFY_MODES.get(verify_code, f"Verify {verify_code}")
 
     PUNCH_LOGS.insert(0, punch)
-    if len(PUNCH_LOGS) > 1000:
-        del PUNCH_LOGS[1000:]
+    prune_punch_logs()
 
     try:
         with open(LOGS_FILE, "w", encoding="utf-8") as f:
@@ -455,6 +533,68 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
     return parsed_records
 
 
+def parse_userinfo(body_str: str, sn: str):
+    """Parse pushed user info / name tables from eSSL / ZKTeco hardware."""
+    if not body_str:
+        return
+    updated = 0
+    for line in body_str.replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line or is_header_or_metadata_line(line):
+            continue
+        pin = None
+        name = None
+        role = "Normal User"
+
+        # Key=Value format: PIN=2\tName=Deepak\tPri=0
+        if "PIN=" in line.upper() or "NAME=" in line.upper():
+            kv = {}
+            # USERINFO values, especially Name, may contain spaces. Tabs are
+            # field separators in the ADMS payload; splitting on every space
+            # changed "Name=Deepak Kumar" into "Deepak" or lost it entirely.
+            fields = line.split("\t") if "\t" in line else line.split()
+            for item in fields:
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    kv[k.strip().upper()] = v.strip().strip('"')
+            pin = str(kv.get("PIN") or kv.get("USERID") or "")
+            name = kv.get("NAME")
+            try:
+                pri = int(kv.get("PRI") or kv.get("PRIVILEGE") or 0)
+                role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+            except Exception:
+                pass
+        else:
+            # Tab separated: PIN \t Name \t Pass \t Card \t Pri \t Grp
+            parts = [p.strip() for p in line.split("\t")]
+            if len(parts) >= 2 and parts[0]:
+                pin = str(parts[0])
+                name = parts[1]
+                if len(parts) > 4:
+                    try:
+                        pri = int(parts[4])
+                        role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+                    except Exception:
+                        pass
+
+        if pin and name and not name.startswith("User "):
+            DEVICE_USER_CACHE[pin] = {
+                "name": name,
+                "role": role
+            }
+            save_device_user_db(sn, pin, name, role)
+            # Update any existing logs in memory that were waiting for this name
+            for p in PUNCH_LOGS:
+                if str(p.get("userId", "")).strip() == pin:
+                    p["userName"] = name
+                    p["userRole"] = role
+            updated += 1
+
+    if updated > 0:
+        save_user_cache()
+        print(f"\033[1;32m[Push User Names Captured]\033[0m Learned {updated} user name(s) directly from machine {sn}!")
+
+
 def parse_oplog(body_str: str, sn: str):
     """Parse and log device administration operations (OPLOG / OPERLOG)."""
     if not body_str:
@@ -489,9 +629,12 @@ def get_query_param_ci(request: Request, key: str, default: str | None = None) -
 # ==========================================
 
 @router.get("/api/punches")
-async def get_punches():
-    """API to get punch history."""
-    return {"count": len(PUNCH_LOGS), "data": PUNCH_LOGS}
+async def get_punches(days: int = HISTORY_DAYS):
+    """Return the complete local attendance history for the requested window."""
+    window = min(max(days, 1), HISTORY_DAYS)
+    cutoff = datetime.now() - timedelta(days=window)
+    rows = [p for p in PUNCH_LOGS if (when := _log_timestamp(p)) is None or when >= cutoff]
+    return {"count": len(rows), "days": window, "data": rows}
 
 
 @router.post("/api/clear")
@@ -556,6 +699,8 @@ async def auto_sync_device_users_bg(sn: str, client_ip: str | None = None):
 
     users = await asyncio.to_thread(_pull)
     if not users:
+        # TCP connection to port 4370 failed (e.g. reader behind NAT). Queue ADMS push query!
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
         return
 
     updated = 0
@@ -705,7 +850,6 @@ async def sync_device_punches(request: Request) -> JSONResponse:
             "verifyLabel": VERIFY_MODES.get(str(r.punch if r.punch is not None else 1), "Fingerprint")
         }
         broadcast_punch(punch_obj)
-        PUNCH_LOGS.insert(0, punch_obj)
         existing_keys.add((uid_str, ts_str))
         new_added += 1
 
@@ -719,7 +863,8 @@ async def sync_device_punches(request: Request) -> JSONResponse:
     if new_added > 0:
         try:
             with open(LOGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(PUNCH_LOGS[:2000], f, indent=2, default=str)
+                prune_punch_logs()
+                json.dump(PUNCH_LOGS, f, indent=2, default=str)
         except Exception:
             pass
 
@@ -731,6 +876,13 @@ async def sync_device_punches(request: Request) -> JSONResponse:
         "totalStored": len(PUNCH_LOGS),
         "usersDiscovered": names_updated
     })
+
+
+@router.post("/api/device/query-users")
+async def trigger_query_users(sn: str = "NFZ8254900401"):
+    """Queue an ADMS command to query all user names from the hardware reader."""
+    cmd = queue_device_cmd(sn, "DATA QUERY USERINFO")
+    return {"ok": True, "message": f"Queued '{cmd}' for device {sn}. Machine will upload user list on next poll."}
 
 
 @router.get("/api/users")
@@ -778,6 +930,8 @@ async def set_user_name(request: Request):
     except Exception:
         pass
 
+    device_sn = str(data.get("device_serial") or data.get("sn") or "NFZ8254900401").strip()
+    save_device_user_db(device_sn, user_id, name, role or current_info.get("role", "Normal User"))
     print(f"\033[1;32m[User Name Saved]\033[0m Mapped ID \033[1;33m{user_id}\033[0m -> \033[1;97m{name}\033[0m ({updated_count} punches updated)")
     return {"ok": True, "message": f"Updated name for User {user_id} to '{name}'", "updatedPunches": updated_count}
 
@@ -861,6 +1015,8 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # 1.1 Device Handshake / Initialization (GET)
     if request.method == "GET":
         print(f"\n\033[1;32m[iClock Handshake Connected]\033[0m Device SN: \033[1;33m{sn}\033[0m from IP: \033[1;36m{client_ip}\033[0m")
+        # Automatically ask machine to push all user names it has on its screen/hardware
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
         asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         config_response = "\n".join([
@@ -903,6 +1059,12 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Route by Table Type
     if "OPERLOG" in effective_table or "OPLOG" in effective_table:
         parse_oplog(body_str, sn)
+        # Any admin action on device (adding user, finger, card, etc.) -> query userinfo to learn real names
+        queue_device_cmd(sn, "DATA QUERY USERINFO")
+        return PlainTextResponse(content="OK", media_type="text/plain")
+
+    if "USERINFO" in effective_table or "USER" in effective_table:
+        parse_userinfo(body_str, sn)
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
@@ -914,6 +1076,7 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
             for p in new_punches
         )
         if has_unknown:
+            queue_device_cmd(sn, "DATA QUERY USERINFO")
             asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         for punch in new_punches:

@@ -504,9 +504,10 @@
 
       <div class="table-container">
         <div class="table-header">
-          <h2>Live Attendance Punches (<span id="count">0</span>)</h2>
+          <h2>Attendance Punches — Last 30 Days (<span id="count">0</span>)</h2>
           <div style="display: flex; gap: 10px;">
             <button class="btn btn-primary" id="btn-sync-device" onclick="syncPunchesFromDevice()">🔄 Sync Machine Punches</button>
+            <button class="btn btn-outline" onclick="syncDeviceNames()">👥 Sync Device Names</button>
             <button class="btn btn-outline" onclick="promptAddName()">➕ Set Employee Name</button>
             <button class="btn btn-clear" onclick="clearLogs()">Clear History</button>
           </div>
@@ -889,6 +890,7 @@
             </div>
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn btn-success" onclick="promptCreateUser('source')">➕ Create User</button>
             <button class="btn btn-outline" onclick="selectAllSourceUsers(true)">Select All</button>
             <button class="btn btn-outline" onclick="selectAllSourceUsers(false)">Deselect All</button>
             <button class="btn btn-clear" style="color: #ef4444; border-color: rgba(239,68,68,0.4); padding: 5px 12px; font-size: 0.8rem;" onclick="deleteSelectedSourceUsers()" title="Delete selected users and biometrics from Source reader">
@@ -952,6 +954,7 @@
             </div>
           </div>
           <div style="display: flex; gap: 8px; align-items: center;">
+            <button class="btn btn-success" onclick="promptCreateUser('target')">➕ Create User</button>
             <button class="btn btn-outline" onclick="scanTargetUsers()">📋 Scan Target Device</button>
             <button class="btn btn-outline" onclick="selectAllTargetUsers(true)">Select All</button>
             <button class="btn btn-outline" onclick="selectAllTargetUsers(false)">Deselect All</button>
@@ -1423,8 +1426,22 @@
       }
     }
 
+    async function syncDeviceNames() {
+      const serial = prompt('Enter the eSSL device serial number:', 'NFZ8254900401');
+      if (!serial || !serial.trim()) return;
+      try {
+        const resp = await fetch('/api/device/query-users?sn=' + encodeURIComponent(serial.trim()), {
+          method: 'POST'
+        });
+        const data = await resp.json();
+        alert(data.message || (data.ok ? 'User-name sync queued.' : 'Could not queue user-name sync.'));
+      } catch (err) {
+        alert('Could not queue user-name sync: ' + err.message);
+      }
+    }
+
     function loadInitial() {
-      fetch('/api/punches')
+      fetch('/api/punches?days=30')
         .then(res => res.json())
         .then(res => {
           logs = res.data || [];
@@ -1652,6 +1669,42 @@
       }
     }
 
+    async function promptCreateUser(type) {
+      const userId = prompt('Enter the new User ID / PIN:');
+      if (!userId || !userId.trim()) return;
+      const name = prompt(`Enter the employee name for PIN ${userId.trim()}:`);
+      if (!name || !name.trim()) return;
+      const makeAdmin = confirm('Should this user be a device administrator?\nChoose Cancel for a normal user.');
+      const cardInput = prompt('Card number (optional):', '0');
+
+      const sn = document.getElementById(`${type}-sn`).value.trim();
+      const ip = document.getElementById(`${type}-ip`).value.trim();
+      const port = parseInt(document.getElementById(`${type}-port`).value) || 4370;
+      logTerminal(`Creating user ${userId.trim()} (${name.trim()}) on ${type} device ${sn}...`, 'log-step');
+
+      try {
+        const resp = await fetch('/api/migration/create-user', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sn, ip, port,
+            userId: userId.trim(),
+            name: name.trim(),
+            privilege: makeAdmin ? 14 : 0,
+            card: parseInt(cardInput || '0') || 0,
+            simulate: isSimulate
+          })
+        });
+        const data = await resp.json();
+        if (!data.ok) throw new Error(data.error || 'User creation failed');
+        logTerminal(data.message || `Created user ${userId.trim()} on ${sn}.`, 'log-success');
+        if (type === 'source') await scanSourceUsers();
+        else await scanTargetUsers();
+      } catch (err) {
+        logTerminal(`Create user failed: ${err.message}`, 'log-error');
+      }
+    }
+
     function renderSourceUsers() {
       const tbody = document.getElementById('source-users-body');
       tbody.innerHTML = '';
@@ -1704,7 +1757,7 @@
         const resp = await fetch('/api/migration/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sn, ip, port, userId, simulate: isSimulate })
+          body: JSON.stringify({ sn, ip, port, userId, deleteBiometricsOnly: false, simulate: isSimulate })
         });
         const data = await resp.json();
         if (data.ok) {
@@ -1855,7 +1908,7 @@
         const resp = await fetch('/api/migration/delete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sn, ip, port, userId, simulate: isSimulate })
+          body: JSON.stringify({ sn, ip, port, userId, deleteBiometricsOnly: false, simulate: isSimulate })
         });
         const data = await resp.json();
         if (data.ok) {
@@ -1888,7 +1941,7 @@
         const resp = await fetch('/api/migration/delete-batch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sn, ip, port, userIds: uids, simulate: isSimulate })
+          body: JSON.stringify({ sn, ip, port, userIds: uids, deleteBiometricsOnly: false, simulate: isSimulate })
         });
         const data = await resp.json();
         if (data.ok) {
@@ -1921,7 +1974,7 @@
         const resp = await fetch('/api/migration/delete-batch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sn, ip, port, userIds: uids, simulate: isSimulate })
+          body: JSON.stringify({ sn, ip, port, userIds: uids, deleteBiometricsOnly: false, simulate: isSimulate })
         });
         const data = await resp.json();
         if (data.ok) {
