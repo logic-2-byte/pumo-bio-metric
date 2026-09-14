@@ -18,6 +18,7 @@ router = APIRouter(tags=["iclock"])
 DEVICE_COMMAND_QUEUE: dict[str, list[str]] = {}
 _DEVICE_CMD_COUNTER: int = 1000
 
+
 def queue_device_cmd(sn: str, cmd_body: str) -> str:
     """Queue an ADMS command to be dispatched on the device's next /iclock/getrequest poll."""
     global _DEVICE_CMD_COUNTER
@@ -27,6 +28,7 @@ def queue_device_cmd(sn: str, cmd_body: str) -> str:
     DEVICE_COMMAND_QUEUE.setdefault(clean_sn, []).append(cmd_str)
     print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str}")
     return cmd_str
+
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 LOGS_FILE = os.path.join(BASE_DIR, "attendance_logs.json")
@@ -280,7 +282,6 @@ def get_user_info(user_id: str) -> dict:
     return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
 
 
-
 def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str = None):
     """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
     try:
@@ -305,7 +306,7 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
                     card_no = COALESCE(EXCLUDED.card_no, biometric_device_users.card_no),
                     updated_at = now();
             """, (clean_sn, clean_pin, clean_name, clean_role, str(card) if card else None))
-            
+
             # Also retroactively update punches in biometric_punch_log that were recorded with 'User <pin>' or NULL
             cur.execute("""
                 UPDATE biometric_punch_log
@@ -318,7 +319,6 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
             print(f"\033[1;32m[DB Sync]\033[0m Persisted user {clean_pin} -> '{clean_name}' ({clean_role}) to biometric_device_users.", flush=True)
     except Exception as exc:
         print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
-
 
 
 def format_punch_banner(punch: dict, client_ip: str = "") -> str:
@@ -531,7 +531,6 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
         })
 
     return parsed_records
-
 
 
 def parse_userinfo(body_str: str, sn: str):
@@ -879,7 +878,6 @@ async def sync_device_punches(request: Request) -> JSONResponse:
     })
 
 
-
 @router.post("/api/device/query-users")
 async def trigger_query_users(sn: str = "NFZ8254900401"):
     """Queue an ADMS command to query all user names from the hardware reader."""
@@ -1190,4 +1188,3 @@ async def ping_handler(request: Request) -> PlainTextResponse:
     """Heartbeat routes. Some firmware calls these before it will push."""
     mark_seen(get_query_param_ci(request, "SN"), request)
     return PlainTextResponse("OK", media_type="text/plain")
-

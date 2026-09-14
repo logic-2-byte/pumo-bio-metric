@@ -621,7 +621,7 @@ def create_device_user(
             command = queue_device_cmd(
                 sn,
                 f"DATA UPDATE USERINFO PIN={pin}\tName={clean_name}\tPri={normalized_privilege}"
-                f"\tPasswd={str(password or '')}\tCard={int(card or 0)}\tGrp=1",
+                f"\tPasswd={password or ''!s}\tCard={int(card or 0)}\tGrp=1",
             )
             return {
                 "ok": True, "created": True, "queued": True, "simulated": False,
@@ -822,22 +822,21 @@ def delete_device_user_real(
                     "userId": u_pin,
                     "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
                 }
-            else:
-                # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
-                c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
-                c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
-                c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-                c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
-                return {
-                    "ok": True,
-                    "simulated": False,
-                    "deleted": True,
-                    "queued": True,
-                    "biometricsOnly": False,
-                    "device": sn,
-                    "userId": u_pin,
-                    "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
-                }
+            # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
+            c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
+            c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
+            c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+            c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+            return {
+                "ok": True,
+                "simulated": False,
+                "deleted": True,
+                "queued": True,
+                "biometricsOnly": False,
+                "device": sn,
+                "userId": u_pin,
+                "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
+            }
         except Exception as q_err:
             logger.exception("Failed to queue ADMS push delete command: %s", q_err)
             return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}

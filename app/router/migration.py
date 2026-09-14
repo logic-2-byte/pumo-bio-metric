@@ -379,7 +379,7 @@ async def api_transfer_single_user(request: Request) -> JSONResponse:
                     ON CONFLICT (device_serial, device_user_id) 
                     DO UPDATE SET name = EXCLUDED.name, updated_at = now();
                 """, (target_id, actual_target_pin, name_val, "Normal User"))
-                
+
                 # If move mode, remove from source device
                 if mode == "move":
                     cur.execute("""
