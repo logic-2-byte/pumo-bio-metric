@@ -3,6 +3,7 @@ Pytest unit tests for Biometric Deletion, Offboarding, and Target Device Cleanup
 """
 import pytest
 from app.core.device_migration import (
+    create_device_user,
     delete_batch_device_users,
     delete_device_user,
     fetch_device_users,
@@ -45,6 +46,20 @@ def test_delete_copied_user_from_target_device_only():
 
     assert not any(str(u["userId"]) == "101" for u in tgt_users_after)
     assert any(str(u["userId"]) == "101" for u in src_users_after)
+
+
+def test_create_user_profile_then_full_delete():
+    """The localhost controls create and remove the whole profile, not only fingers."""
+    sn = "UFZ9876543210"
+    created = create_device_user(sn, "550", "Excel Name Person", simulate=True)
+    assert created["ok"] is True
+    users = fetch_device_users(sn, simulate=True)["users"]
+    assert any(u["userId"] == "550" and u["name"] == "Excel Name Person" for u in users)
+
+    deleted = delete_device_user(sn, "550", simulate=True)
+    assert deleted["ok"] is True
+    assert deleted["biometricsOnly"] is False
+    assert not any(u["userId"] == "550" for u in fetch_device_users(sn, simulate=True)["users"])
 
 
 def test_delete_biometrics_only():

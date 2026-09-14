@@ -514,6 +514,12 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
             role_label = "Super Admin" if u.privilege == 14 else ("Manager" if u.privilege == 2 else "Normal User")
             emp_info = get_employee_info(u.user_id)
             emp_name = emp_info["name"] if not emp_info["name"].startswith("User ") else (u.name or f"User {u.user_id}")
+            if u.name and str(u.name).strip():
+                try:
+                    from app.router.iclock import save_device_user_db
+                    save_device_user_db(target_sn, str(u.user_id), str(u.name).strip(), role_label, str(u.card or ""))
+                except Exception:
+                    pass
             users_list.append({
                 "uid": u.uid,
                 "userId": str(u.user_id),
@@ -542,6 +548,146 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
                 conn.disconnect()
             except Exception:
                 pass
+
+
+def create_device_user(
+    device_id: str,
+    user_id: str,
+    name: str,
+    port: int = 4370,
+    timeout: int = 5,
+    privilege: int = 0,
+    password: str = "",
+    card: int = 0,
+    simulate: bool = False,
+    ip_override: str | None = None,
+) -> dict[str, Any]:
+    """Create a complete PIN/name user profile on a reader and verify it exists."""
+    pin = str(user_id).strip()
+    clean_name = str(name).strip()
+    if not pin or not clean_name:
+        return {"ok": False, "error": "User ID / PIN and employee name are required."}
+    if len(pin) > 24:
+        return {"ok": False, "error": "User ID / PIN must be at most 24 characters."}
+
+    resolved = resolve_device(device_id, port)
+    sn = resolved["sn"]
+    ip = ip_override if ip_override and "." in ip_override else resolved["ip"]
+    target_port = resolved["port"]
+    normalized_privilege = 14 if int(privilege or 0) == 14 else 0
+
+    if simulate:
+        dev = SIMULATED_DEVICES.get(sn) or SIMULATED_DEVICES.get(ip)
+        if not dev:
+            return {"ok": False, "error": f"Simulated device {sn} not found"}
+        if any(str(u.get("user_id")) == pin for u in dev.get("users", [])):
+            return {"ok": False, "error": f"User {pin} already exists on device {sn}."}
+        next_uid = max((int(u.get("uid", 0)) for u in dev.get("users", [])), default=0) + 1
+        dev.setdefault("users", []).append({
+            "uid": next_uid,
+            "user_id": pin,
+            "name": clean_name,
+            "privilege": normalized_privilege,
+            "password": str(password or ""),
+            "group_id": "1",
+            "card": int(card or 0),
+            "fingers": [],
+        })
+        return {
+            "ok": True, "created": True, "simulated": True, "device": sn,
+            "userId": pin, "name": clean_name,
+            "message": f"Created user {pin} ({clean_name}) on simulated device {sn}."
+        }
+
+    if not HAS_PYZK:
+        return {"ok": False, "error": "The 'pyzk' package is not installed."}
+
+    conn = None
+    try:
+        _, conn = connect_zk_device(ip, target_port, timeout)
+        conn.disable_device()
+        users = conn.get_users() or []
+        if any(str(u.user_id) == pin for u in users):
+            return {"ok": False, "error": f"User {pin} already exists on device {sn}."}
+        next_uid = max((int(u.uid) for u in users), default=0) + 1
+        conn.set_user(
+            uid=next_uid,
+            name=clean_name,
+            privilege=normalized_privilege,
+            password=str(password or ""),
+            group_id="1",
+            user_id=pin,
+            card=int(card or 0),
+        )
+        conn.refresh_data()
+        created = next((u for u in (conn.get_users() or []) if str(u.user_id) == pin), None)
+        if created is None:
+            raise RuntimeError("Device accepted the command but the user profile was not found during verification")
+        try:
+            from app.router.iclock import DEVICE_USER_CACHE, save_device_user_db, save_user_cache
+            DEVICE_USER_CACHE[pin] = {
+                "name": str(created.name or clean_name).strip(),
+                "role": "Super Admin" if normalized_privilege == 14 else "Normal User",
+                "privilege": normalized_privilege,
+                "card": int(card or 0),
+            }
+            save_user_cache()
+            save_device_user_db(sn, pin, clean_name, DEVICE_USER_CACHE[pin]["role"], str(card or ""))
+        except Exception:
+            pass
+        return {
+            "ok": True, "created": True, "simulated": False, "device": sn,
+            "userId": pin, "uid": int(created.uid), "name": str(created.name or clean_name).strip(),
+            "message": f"Created and verified user {pin} ({clean_name}) on device {sn}."
+        }
+    except Exception as exc:
+        logger.warning("Direct user creation failed for %s (%s); queueing ADMS command: %s", sn, ip, exc)
+        try:
+            from app.router.iclock import queue_device_cmd
+            command = queue_device_cmd(
+                sn,
+                f"DATA UPDATE USERINFO PIN={pin}\tName={clean_name}\tPri={normalized_privilege}"
+                f"\tPasswd={password or ''!s}\tCard={int(card or 0)}\tGrp=1",
+            )
+            return {
+                "ok": True, "created": True, "queued": True, "simulated": False,
+                "device": sn, "userId": pin, "name": clean_name,
+                "message": f"User creation queued for device {sn}; it will run on the next device poll ({command})."
+            }
+        except Exception as queue_error:
+            return {"ok": False, "device": sn, "userId": pin, "error": f"{exc}; queue failed: {queue_error}"}
+    finally:
+        if conn:
+            try:
+                conn.enable_device()
+            except Exception:
+                pass
+            try:
+                conn.disconnect()
+            except Exception:
+                pass
+
+
+def _remove_user_metadata(device_serial: str, user_id: str) -> None:
+    """Remove the deleted profile from local name caches and the LMS device-user mirror."""
+    pin = str(user_id).strip()
+    try:
+        from app.router.iclock import DEVICE_USER_CACHE, save_user_cache
+        DEVICE_USER_CACHE.pop(pin, None)
+        save_user_cache()
+    except Exception:
+        pass
+    try:
+        from app.sync.config import config
+        from app.sync.lms_db import LmsDatabase
+        db = LmsDatabase(config)
+        with db._connection() as db_conn, db_conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM biometric_device_users WHERE device_serial = %s AND device_user_id = %s",
+                (device_serial, pin),
+            )
+    except Exception as exc:
+        logger.warning("Could not remove metadata for deleted device user %s/%s: %s", device_serial, pin, exc)
 
 
 def delete_device_user_simulated(
@@ -618,6 +764,8 @@ def delete_device_user_real(
         users = conn.get_users()
         target_user = next((u for u in users if str(u.user_id) == str(user_id)), None)
         if not target_user:
+            if not delete_biometrics_only:
+                _remove_user_metadata(sn, str(user_id))
             conn.enable_device()
             return {
                 "ok": True,
@@ -668,6 +816,10 @@ def delete_device_user_real(
 
         conn.delete_user(uid=target_user.uid, user_id=str(user_id))
         conn.refresh_data()
+        remaining = conn.get_users() or []
+        if any(str(u.user_id) == str(user_id) for u in remaining):
+            raise RuntimeError("Device still reports the user profile after CMD_DELETE_USER")
+        _remove_user_metadata(sn, str(user_id))
         conn.enable_device()
         return {
             "ok": True,
@@ -696,25 +848,27 @@ def delete_device_user_real(
                     "userId": u_pin,
                     "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
                 }
-            else:
-                # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
-                c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
-                c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
-                c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-                c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
-                return {
-                    "ok": True,
-                    "simulated": False,
-                    "deleted": True,
-                    "queued": True,
-                    "biometricsOnly": False,
-                    "device": sn,
-                    "userId": u_pin,
-                    "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
-                }
+            # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
+            c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
+            c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
+            c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+            c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+            return {
+                "ok": True,
+                "simulated": False,
+                "deleted": True,
+                "queued": True,
+                "biometricsOnly": False,
+                "device": sn,
+                "userId": u_pin,
+                "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
+            }
         except Exception as q_err:
             logger.exception("Failed to queue ADMS push delete command: %s", q_err)
             return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}
+        finally:
+            if not delete_biometrics_only:
+                _remove_user_metadata(sn, str(user_id))
     finally:
         if conn:
             try:
@@ -830,10 +984,24 @@ def delete_batch_device_users(
                 })
 
         conn.refresh_data()
+        remaining_ids = {str(u.user_id) for u in (conn.get_users() or [])}
+        for result in results:
+            if delete_biometrics_only or not result.get("deleted"):
+                continue
+            pin = str(result.get("userId"))
+            if pin in remaining_ids:
+                result.update({
+                    "ok": False,
+                    "deleted": False,
+                    "error": "Device still reports the user profile after CMD_DELETE_USER",
+                })
+            else:
+                _remove_user_metadata(sn, pin)
         conn.enable_device()
         deleted_count = sum(1 for r in results if r.get("deleted"))
+        all_ok = all(r.get("ok", False) for r in results)
         return {
-            "ok": True,
+            "ok": all_ok,
             "simulated": False,
             "device": sn,
             "deletedCount": deleted_count,
