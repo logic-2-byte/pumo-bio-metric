@@ -149,6 +149,42 @@ def test_handshake_returns_device_options() -> None:
     assert "GET OPTION FROM" in response.text
 
 
+def test_adms_onboarding_queues_user_data_before_30_day_attendance(monkeypatch) -> None:
+    """Onboarding uses only the device-initiated ADMS command channel."""
+    monkeypatch.setattr(iclock, "save_adms_state", lambda: None)
+    iclock.DEVICE_COMMAND_QUEUE.clear()
+    iclock.COMMAND_TRACKING.clear()
+    iclock.ADMS_IMPORT_JOBS.clear()
+
+    job = iclock.start_adms_onboarding("TEST-ADMS")
+    commands = iclock.DEVICE_COMMAND_QUEUE["TEST-ADMS"]
+
+    assert len(commands) == 2
+    assert commands[0].endswith("DATA QUERY USERINFO")
+    assert "DATA QUERY ATTLOG StartTime=" in commands[1]
+    assert "\tEndTime=" in commands[1]
+    assert job["days"] == 30
+
+
+def test_adms_import_tracks_attlog_acknowledgement(monkeypatch) -> None:
+    monkeypatch.setattr(iclock, "save_adms_state", lambda: None)
+    iclock.DEVICE_COMMAND_QUEUE.clear()
+    iclock.COMMAND_TRACKING.clear()
+    iclock.ADMS_IMPORT_JOBS.clear()
+
+    job = iclock.start_adms_onboarding("TEST-ACK")
+    attlog_id = job["commands"][1].split(":", 2)[1]
+    iclock.record_import_users("TEST-ACK", 3)
+    iclock.record_import_punches("TEST-ACK", 8, 5)
+    iclock.record_command_result("TEST-ACK", f"ID={attlog_id}&Return=0&CMD=DATA")
+
+    assert job["usersReceived"] == 3
+    assert job["punchesReceived"] == 8
+    assert job["punchesStored"] == 5
+    assert job["duplicates"] == 3
+    assert job["status"] == "completed"
+
+
 def test_push_is_acknowledged_even_with_no_lms() -> None:
     """
     The single most important behaviour of the push path.

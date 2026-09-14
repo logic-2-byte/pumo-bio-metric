@@ -209,3 +209,4 @@ spool/
 attendance_logs.json
 user_names.json
 data/logs/
+data/adms_state.json

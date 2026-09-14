@@ -6,6 +6,7 @@ import socket
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -18,14 +19,26 @@ router = APIRouter(tags=["iclock"])
 DEVICE_COMMAND_QUEUE: dict[str, list[str]] = {}
 _DEVICE_CMD_COUNTER: int = 1000
 
+# Commands and onboarding jobs are persisted because ADMS readers poll us: a
+# restart must not silently discard the next action the reader is waiting for.
+COMMAND_TRACKING: dict[str, dict] = {}
+ADMS_IMPORT_JOBS: dict[str, dict] = {}
 
-def queue_device_cmd(sn: str, cmd_body: str) -> str:
+
+def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
+                     action: str | None = None) -> str:
     """Queue an ADMS command to be dispatched on the device's next /iclock/getrequest poll."""
     global _DEVICE_CMD_COUNTER
     _DEVICE_CMD_COUNTER += 1
     clean_sn = str(sn or "").strip().upper()
     cmd_str = f"C:{_DEVICE_CMD_COUNTER}:{cmd_body.strip()}"
     DEVICE_COMMAND_QUEUE.setdefault(clean_sn, []).append(cmd_str)
+    COMMAND_TRACKING[str(_DEVICE_CMD_COUNTER)] = {
+        "sn": clean_sn, "command": cmd_body.strip(), "jobId": job_id,
+        "action": action or "command", "status": "queued",
+        "queuedAt": datetime.now().isoformat(),
+    }
+    save_adms_state()
     print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str}")
     return cmd_str
 
@@ -33,6 +46,132 @@ def queue_device_cmd(sn: str, cmd_body: str) -> str:
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 LOGS_FILE = os.path.join(BASE_DIR, "attendance_logs.json")
 USER_NAMES_FILE = os.path.join(BASE_DIR, "user_names.json")
+ADMS_STATE_FILE = os.path.join(BASE_DIR, "data", "adms_state.json")
+
+
+def save_adms_state() -> None:
+    """Atomically persist ADMS commands and historical-import progress."""
+    try:
+        os.makedirs(os.path.dirname(ADMS_STATE_FILE), exist_ok=True)
+        state = {
+            "commandCounter": _DEVICE_CMD_COUNTER,
+            "queue": DEVICE_COMMAND_QUEUE,
+            "commands": COMMAND_TRACKING,
+            "jobs": ADMS_IMPORT_JOBS,
+        }
+        temporary = f"{ADMS_STATE_FILE}.tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(temporary, ADMS_STATE_FILE)
+    except Exception as exc:
+        print(f"[ADMS State Warning] Could not persist command state: {exc}", flush=True)
+
+
+def load_adms_state() -> None:
+    global _DEVICE_CMD_COUNTER
+    try:
+        with open(ADMS_STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+        _DEVICE_CMD_COUNTER = max(_DEVICE_CMD_COUNTER, int(state.get("commandCounter", 1000)))
+        DEVICE_COMMAND_QUEUE.update({str(k).upper(): list(v) for k, v in state.get("queue", {}).items()})
+        COMMAND_TRACKING.update(state.get("commands", {}))
+        ADMS_IMPORT_JOBS.update(state.get("jobs", {}))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[ADMS State Warning] Could not load command state: {exc}", flush=True)
+
+
+def _active_import_job(sn: str) -> dict | None:
+    clean_sn = str(sn).strip().upper()
+    for job in ADMS_IMPORT_JOBS.values():
+        if job.get("sn") == clean_sn and job.get("status") in {"queued", "receiving"}:
+            return job
+    return None
+
+
+def start_adms_onboarding(sn: str, *, days: int = 30) -> dict:
+    """Queue one safe, ADMS-only user and attendance recovery job per reader."""
+    clean_sn = str(sn or "").strip().upper()
+    if not clean_sn:
+        raise ValueError("Device serial number is required")
+    existing_jobs = [job for job in ADMS_IMPORT_JOBS.values() if job.get("sn") == clean_sn]
+    if existing_jobs:
+        latest = max(existing_jobs, key=lambda job: job.get("createdAt", ""))
+        # Reconnects must not queue the same 30-day import repeatedly. A failed
+        # job is the only one that is safe to retry automatically.
+        if latest.get("status") != "failed":
+            return latest
+
+    end_at = datetime.now().replace(microsecond=0)
+    start_at = end_at - timedelta(days=days)
+    job_id = f"{clean_sn}-{end_at.strftime('%Y%m%d%H%M%S')}"
+    job = {
+        "id": job_id, "sn": clean_sn, "status": "queued", "days": days,
+        "startTime": start_at.isoformat(), "endTime": end_at.isoformat(),
+        "createdAt": datetime.now().isoformat(), "usersReceived": 0,
+        "punchesReceived": 0, "punchesStored": 0, "duplicates": 0,
+        "commands": [], "errors": [],
+    }
+    ADMS_IMPORT_JOBS[job_id] = job
+    users_command = queue_device_cmd(clean_sn, "DATA QUERY USERINFO", job_id=job_id, action="userinfo")
+    logs_command = queue_device_cmd(
+        clean_sn,
+        "DATA QUERY ATTLOG "
+        f"StartTime={start_at.strftime('%Y-%m-%dT%H:%M:%S')}\t"
+        f"EndTime={end_at.strftime('%Y-%m-%dT%H:%M:%S')}",
+        job_id=job_id,
+        action="attlog",
+    )
+    job["commands"] = [users_command, logs_command]
+    save_adms_state()
+    return job
+
+
+def record_import_users(sn: str, count: int) -> None:
+    job = _active_import_job(sn)
+    if job is not None:
+        job["usersReceived"] += max(0, count)
+        job["status"] = "receiving"
+        save_adms_state()
+
+
+def record_import_punches(sn: str, received: int, stored: int = 0) -> None:
+    job = _active_import_job(sn)
+    if job is not None:
+        job["punchesReceived"] += max(0, received)
+        job["punchesStored"] += max(0, stored)
+        job["duplicates"] += max(0, received - stored)
+        job["status"] = "receiving"
+        save_adms_state()
+
+
+def record_command_result(sn: str | None, body: str) -> None:
+    """Associate a devicecmd acknowledgement with a durable queued command."""
+    for line in body.replace("\r", "\n").splitlines() or [body]:
+        parsed = parse_qs(line, keep_blank_values=True)
+        command_id = (parsed.get("ID") or [""])[0]
+        if not command_id or command_id not in COMMAND_TRACKING:
+            continue
+        tracked = COMMAND_TRACKING[command_id]
+        result = (parsed.get("Return") or [""])[0]
+        tracked["status"] = "acknowledged" if result == "0" else "failed"
+        tracked["returnCode"] = result
+        tracked["acknowledgedAt"] = datetime.now().isoformat()
+        job = ADMS_IMPORT_JOBS.get(tracked.get("jobId") or "")
+        if job is not None:
+            if result != "0":
+                job["status"] = "failed"
+                job["errors"].append(f"{tracked.get('action')} command returned {result or 'no code'}")
+            elif tracked.get("action") == "attlog":
+                job["status"] = "completed"
+                job["completedAt"] = datetime.now().isoformat()
+            else:
+                job["status"] = "receiving"
+        save_adms_state()
+
+
+load_adms_state()
 
 # In-memory punch records store
 PUNCH_LOGS: list[dict] = []
@@ -247,20 +386,32 @@ def get_local_ips() -> list[str]:
 
 
 def get_user_info(user_id: str) -> dict:
-    """Helper: Get user info from local cache, or query LMS Postgres database for real staff name."""
+    """Resolve a PIN, preferring its authoritative LMS staff mapping."""
     u_id = str(user_id).strip()
-    if u_id in DEVICE_USER_CACHE:
-        cached = DEVICE_USER_CACHE[u_id]
-        if cached.get("name") and not cached["name"].startswith("User "):
-            return cached
-
-    # Query LMS PostgreSQL: first biometric_device_users, then mapped staff member
     try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
-            # 1. Check persistent biometric_device_users table
+            # A staff enrolment is the LMS mapping and must win over the name
+            # typed on a device. This is what keeps historical imports correct
+            # after a reader is renamed or reused.
+            cur.execute("""
+                SELECT s.name, s.designation
+                FROM biometric_enrollments be
+                JOIN staff s ON be.staff_id = s.id
+                WHERE be.device_user_id = %s AND be.ignored = false
+                LIMIT 1
+            """, (u_id,))
+            row = cur.fetchone()
+            if row and row[0]:
+                info = {"name": row[0].strip(), "role": row[1] or "Staff", "designation": row[1] or ""}
+                DEVICE_USER_CACHE[u_id] = info
+                save_user_cache()
+                return info
+
+            # An unmapped PIN remains a device user, so its history is stored
+            # and can be mapped later instead of being thrown away.
             cur.execute("""
                 SELECT name, role FROM biometric_device_users
                 WHERE device_user_id = %s
@@ -272,29 +423,13 @@ def get_user_info(user_id: str) -> dict:
                 DEVICE_USER_CACHE[u_id] = info
                 save_user_cache()
                 return info
-
-            # 2. Check mapped staff member
-            cur.execute("""
-                SELECT s.name, s.designation
-                FROM biometric_enrollments be
-                JOIN staff s ON be.staff_id = s.id
-                WHERE be.device_user_id = %s AND be.ignored = false
-                LIMIT 1
-            """, (u_id,))
-            row = cur.fetchone()
-            if row and row[0]:
-                info = {
-                    "name": row[0].strip(),
-                    "role": row[1] or "Staff",
-                    "designation": row[1] or ""
-                }
-                DEVICE_USER_CACHE[u_id] = info
-                save_user_cache()
-                return info
     except Exception:
         pass
 
-    return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
+    cached = DEVICE_USER_CACHE.get(u_id)
+    if cached and cached.get("name") and not cached["name"].startswith("User "):
+        return cached
+    return {"name": f"User {u_id}", "role": "Normal User"}
 
 
 def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None):
@@ -306,7 +441,10 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
         clean_name = str(name).strip()
         clean_role = str(role or "Normal User").strip()
         clean_sn = str(sn or "UNKNOWN").strip().upper()
-        if not clean_pin or not clean_name or clean_name.startswith("User "):
+        # Keep even a firmware-generated "User <PIN>" profile. It represents a
+        # real device user that may be mapped in the LMS later; only punch
+        # display falls back until that mapping exists.
+        if not clean_pin or not clean_name:
             return
 
         db = LmsDatabase(config)
@@ -551,7 +689,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
 def parse_userinfo(body_str: str, sn: str):
     """Parse pushed user info / name tables from eSSL / ZKTeco hardware."""
     if not body_str:
-        return
+        return 0
     updated = 0
     for line in body_str.replace("\r", "\n").split("\n"):
         line = line.strip()
@@ -592,7 +730,7 @@ def parse_userinfo(body_str: str, sn: str):
                     except Exception:
                         pass
 
-        if pin and name and not name.startswith("User "):
+        if pin and name:
             DEVICE_USER_CACHE[pin] = {
                 "name": name,
                 "role": role
@@ -608,6 +746,7 @@ def parse_userinfo(body_str: str, sn: str):
     if updated > 0:
         save_user_cache()
         print(f"\033[1;32m[Push User Names Captured]\033[0m Learned {updated} user name(s) directly from machine {sn}!")
+    return updated
 
 
 def parse_oplog(body_str: str, sn: str):
@@ -1018,6 +1157,16 @@ async def get_device_status(sn: str):
     }
 
 
+@router.get("/api/device/onboarding-status")
+async def get_onboarding_status(sn: str):
+    """Return the latest ADMS-only user and historical-attendance import job."""
+    clean_sn = str(sn or "").strip().upper()
+    jobs = [job for job in ADMS_IMPORT_JOBS.values() if job.get("sn") == clean_sn]
+    if not jobs:
+        return JSONResponse(status_code=404, content={"ok": False, "error": "No onboarding job for this device"})
+    return {"ok": True, "job": max(jobs, key=lambda item: item.get("createdAt", ""))}
+
+
 # ==========================================
 # eSSL / ZKTeco ADMS & iClock Protocol Endpoints
 # Standalone Live Push Capture (Zero Database Dependency)
@@ -1049,9 +1198,9 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # 1.1 Device Handshake / Initialization (GET)
     if request.method == "GET":
         print(f"\n\033[1;32m[iClock Handshake Connected]\033[0m Device SN: \033[1;33m{sn}\033[0m from IP: \033[1;36m{client_ip}\033[0m")
-        # Automatically ask machine to push all user names it has on its screen/hardware
-        queue_device_cmd(sn, "DATA QUERY USERINFO")
-        asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
+        # ADMS-only onboarding: user metadata is fetched before the 30-day
+        # attendance query. No reverse connection to the device is attempted.
+        start_adms_onboarding(sn)
 
         config_response = "\n".join([
             f"GET OPTION FROM: {sn}",
@@ -1098,7 +1247,7 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     if "USERINFO" in effective_table or "USER" in effective_table:
-        parse_userinfo(body_str, sn)
+        record_import_users(sn, parse_userinfo(body_str, sn))
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
@@ -1111,11 +1260,14 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
         )
         if has_unknown:
             queue_device_cmd(sn, "DATA QUERY USERINFO")
-            asyncio.create_task(auto_sync_device_users_bg(sn, client_ip))
 
         for punch in new_punches:
             print(format_punch_banner(punch, client_ip))
             broadcast_punch(punch)
+
+        # Count every valid device row, even if LMS storage is temporarily
+        # unavailable and the ingest layer has to spool it.
+        record_import_punches(sn, len(new_punches))
 
         # Into the LMS as well as onto the dashboard. Imported here rather than
         # at module import so this router still loads on a host where the sync
@@ -1130,6 +1282,7 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
             from app.sync.push_ingest import ingest
 
             usable, stored = ingest(new_punches)
+            record_import_punches(sn, 0, stored)
             if usable and not stored:
                 print(f"\033[1;33m[LMS]\033[0m {sn}: {usable} pushed punch(es) were "
                       f"already stored or are held on disk")
@@ -1170,6 +1323,11 @@ async def getrequest_handler(request: Request) -> PlainTextResponse:
     clean_sn = str(sn or "").strip().upper()
     if clean_sn and clean_sn in DEVICE_COMMAND_QUEUE and DEVICE_COMMAND_QUEUE[clean_sn]:
         cmd = DEVICE_COMMAND_QUEUE[clean_sn].pop(0)
+        command_id = cmd.split(":", 2)[1] if cmd.count(":") >= 2 else ""
+        if command_id in COMMAND_TRACKING:
+            COMMAND_TRACKING[command_id]["status"] = "dispatched"
+            COMMAND_TRACKING[command_id]["dispatchedAt"] = datetime.now().isoformat()
+        save_adms_state()
         print(f"\033[1;32m[Push Command Dispatched]\033[0m Machine: {clean_sn} -> {cmd}")
         return PlainTextResponse(cmd, media_type="text/plain")
 
@@ -1189,6 +1347,7 @@ async def devicecmd_handler(request: Request) -> PlainTextResponse:
     body_str = raw_body.decode(errors="ignore")
     mark_seen(sn, request)
     print(f"\033[34m[iClock DeviceCmd Response]\033[0m Device: {sn} | Body: {body_str}")
+    record_command_result(sn, body_str)
     return PlainTextResponse("OK", media_type="text/plain")
 
 
