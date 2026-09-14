@@ -73,3 +73,6 @@ SELECT
     has_table_privilege('biometric_bridge', 'biometric_punch_log', 'INSERT') AS writes_punches,
     has_column_privilege('biometric_bridge', 'biometric_devices', 'last_seen_at', 'UPDATE') AS heartbeats,
     has_table_privilege('biometric_bridge', 'staff_punches',       'SELECT') AS reaches_attendance;
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON biometric_device_users TO biometric_bridge;
+GRANT USAGE, SELECT ON SEQUENCE biometric_device_users_id_seq TO biometric_bridge;

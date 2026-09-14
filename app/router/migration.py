@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.core.device_migration import (
+    create_device_user,
     delete_batch_device_users,
     delete_device_user,
     fetch_device_users,
@@ -24,6 +25,47 @@ from app.core.device_migration import (
 )
 
 router = APIRouter(prefix="/api/migration", tags=["migration"])
+
+
+@router.post("/create-user")
+async def api_create_device_user(request: Request) -> JSONResponse:
+    """Create a PIN/name profile directly on a physical or simulated reader."""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Invalid JSON body"})
+
+    device_id = str(data.get("sn") or data.get("deviceSn") or data.get("deviceId") or data.get("ip") or "").strip()
+    user_id = str(data.get("userId") or data.get("pin") or "").strip()
+    name = str(data.get("name") or data.get("userName") or "").strip()
+    if not device_id or not user_id or not name:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Device, User ID / PIN, and employee name are required"},
+        )
+
+    try:
+        privilege = int(data.get("privilege", 0))
+        card = int(data.get("card", 0) or 0)
+        port = int(data.get("port", 4370))
+        timeout = int(data.get("timeout", 8))
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "Privilege, card, port, and timeout must be numbers"})
+
+    result = await asyncio.to_thread(
+        create_device_user,
+        device_id=device_id,
+        user_id=user_id,
+        name=name,
+        port=port,
+        timeout=timeout,
+        privilege=privilege,
+        password=str(data.get("password") or ""),
+        card=card,
+        simulate=bool(data.get("simulate", False)),
+        ip_override=str(data.get("ip") or "").strip() or None,
+    )
+    return JSONResponse(status_code=200 if result.get("ok") else 400, content=result)
 
 
 @router.get("/devices")

@@ -5,7 +5,7 @@ import secrets
 import socket
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -40,6 +40,33 @@ if os.path.exists(LOGS_FILE):
             PUNCH_LOGS = json.load(f)
     except Exception:
         PUNCH_LOGS = []
+
+HISTORY_DAYS = 30
+
+
+def _log_timestamp(punch: dict) -> datetime | None:
+    raw = str(punch.get("timestamp") or "").strip()
+    if not raw:
+        return None
+    for value in (raw, raw.replace("/", "-")):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return None
+
+
+def prune_punch_logs(days: int = HISTORY_DAYS) -> None:
+    """Keep the complete requested history window instead of an arbitrary row count."""
+    cutoff = datetime.now() - timedelta(days=max(1, days))
+    PUNCH_LOGS[:] = [
+        punch for punch in PUNCH_LOGS
+        if (when := _log_timestamp(punch)) is None or when >= cutoff
+    ]
+    PUNCH_LOGS.sort(key=lambda punch: _log_timestamp(punch) or datetime.min, reverse=True)
+
+
+prune_punch_logs()
 
 # Persistent custom user names store
 DEVICE_USER_CACHE: dict[str, dict] = {
@@ -111,7 +138,7 @@ def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = F
     """
     if not sn:
         return
-    clean_sn = sn.strip()
+    clean_sn = sn.strip().upper()
     LAST_SYNC_TIMES[clean_sn] = time.time()
 
     client_ip = None
@@ -345,8 +372,7 @@ def broadcast_punch(punch: dict):
     punch["verifyLabel"] = VERIFY_MODES.get(verify_code, f"Verify {verify_code}")
 
     PUNCH_LOGS.insert(0, punch)
-    if len(PUNCH_LOGS) > 1000:
-        del PUNCH_LOGS[1000:]
+    prune_punch_logs()
 
     try:
         with open(LOGS_FILE, "w", encoding="utf-8") as f:
@@ -524,10 +550,14 @@ def parse_userinfo(body_str: str, sn: str):
         # Key=Value format: PIN=2\tName=Deepak\tPri=0
         if "PIN=" in line.upper() or "NAME=" in line.upper():
             kv = {}
-            for item in line.replace("\t", " ").split():
+            # USERINFO values, especially Name, may contain spaces. Tabs are
+            # field separators in the ADMS payload; splitting on every space
+            # changed "Name=Deepak Kumar" into "Deepak" or lost it entirely.
+            fields = line.split("\t") if "\t" in line else line.split()
+            for item in fields:
                 if "=" in item:
                     k, v = item.split("=", 1)
-                    kv[k.strip().upper()] = v.strip()
+                    kv[k.strip().upper()] = v.strip().strip('"')
             pin = str(kv.get("PIN") or kv.get("USERID") or "")
             name = kv.get("NAME")
             try:
@@ -600,9 +630,12 @@ def get_query_param_ci(request: Request, key: str, default: str | None = None) -
 # ==========================================
 
 @router.get("/api/punches")
-async def get_punches():
-    """API to get punch history."""
-    return {"count": len(PUNCH_LOGS), "data": PUNCH_LOGS}
+async def get_punches(days: int = HISTORY_DAYS):
+    """Return the complete local attendance history for the requested window."""
+    window = min(max(days, 1), HISTORY_DAYS)
+    cutoff = datetime.now() - timedelta(days=window)
+    rows = [p for p in PUNCH_LOGS if (when := _log_timestamp(p)) is None or when >= cutoff]
+    return {"count": len(rows), "days": window, "data": rows}
 
 
 @router.post("/api/clear")
@@ -818,7 +851,6 @@ async def sync_device_punches(request: Request) -> JSONResponse:
             "verifyLabel": VERIFY_MODES.get(str(r.punch if r.punch is not None else 1), "Fingerprint")
         }
         broadcast_punch(punch_obj)
-        PUNCH_LOGS.insert(0, punch_obj)
         existing_keys.add((uid_str, ts_str))
         new_added += 1
 
@@ -832,7 +864,8 @@ async def sync_device_punches(request: Request) -> JSONResponse:
     if new_added > 0:
         try:
             with open(LOGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(PUNCH_LOGS[:2000], f, indent=2, default=str)
+                prune_punch_logs()
+                json.dump(PUNCH_LOGS, f, indent=2, default=str)
         except Exception:
             pass
 
@@ -1157,3 +1190,4 @@ async def ping_handler(request: Request) -> PlainTextResponse:
     """Heartbeat routes. Some firmware calls these before it will push."""
     mark_seen(get_query_param_ci(request, "SN"), request)
     return PlainTextResponse("OK", media_type="text/plain")
+
