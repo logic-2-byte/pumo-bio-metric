@@ -488,6 +488,36 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
             "users": users_list
         }
 
+    # ADMS readers initiate all communication. If this reader recently called
+    # us, scanning users must use the users it pushed to ADMS rather than wait
+    # for an unreachable reverse TCP/4370 connection.
+    try:
+        from app.router.iclock import adms_last_seen, get_adms_device_users, queue_device_cmd
+        if adms_last_seen(target_sn):
+            users_list = get_adms_device_users(target_sn)
+            refresh_command = None
+            if not users_list:
+                refresh_command = queue_device_cmd(target_sn, "DATA QUERY USERINFO")
+            return {
+                "ok": True,
+                "simulated": False,
+                "mode": "adms",
+                "directTcp": False,
+                "serialNumber": target_sn,
+                "ip": target_ip,
+                "count": len(users_list),
+                "users": users_list,
+                "refreshQueued": bool(refresh_command),
+                "message": (
+                    f"User refresh queued ({refresh_command}); scan again after the device polls ADMS."
+                    if refresh_command else
+                    "Users loaded from the ADMS device cache; fingerprint counts require direct device access."
+                ),
+            }
+    except Exception:
+        # Keep legacy direct-TCP scanning available for readers not using ADMS.
+        pass
+
     if not HAS_PYZK:
         return {"ok": False, "error": "The 'pyzk' package is not installed."}
 

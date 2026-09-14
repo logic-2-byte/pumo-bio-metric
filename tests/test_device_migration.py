@@ -72,6 +72,26 @@ def test_fetch_device_users():
     assert users_by_id["111"]["roleLabel"] == "Super Admin"
 
 
+def test_fetch_users_uses_adms_cache_without_tcp(monkeypatch):
+    """An ADMS-connected device must not be scanned through TCP/4370."""
+    import time
+    from app.router import iclock
+
+    monkeypatch.setitem(iclock.LAST_SYNC_TIMES, "NFZ8254900401", time.time())
+    monkeypatch.setattr(iclock, "get_adms_device_users", lambda _sn: [{
+        "uid": None, "userId": "007", "name": "Gowtham", "privilege": 0,
+        "roleLabel": "Normal User", "card": "", "fingerCount": 0,
+        "fingerFids": [], "fingerCountKnown": False, "mappedToLms": True,
+    }])
+
+    res = fetch_device_users("NFZ8254900401")
+
+    assert res["ok"] is True
+    assert res["mode"] == "adms"
+    assert res["directTcp"] is False
+    assert res["users"][0]["name"] == "Gowtham"
+
+
 def test_migration_copy_mode_with_fingerprints():
     """Copy mode transfers user and all fingerprints, keeping source user intact."""
     result = migrate_single_user_simulated(

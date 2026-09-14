@@ -432,6 +432,56 @@ def get_user_info(user_id: str) -> dict:
     return {"name": f"User {u_id}", "role": "Normal User"}
 
 
+def get_adms_device_users(sn: str) -> list[dict]:
+    """List users learned from one ADMS reader, without dialing its TCP port."""
+    clean_sn = str(sn or "").strip().upper()
+    users: list[dict] = []
+    try:
+        from app.sync.config import config
+        from app.sync.lms_db import LmsDatabase
+        db = LmsDatabase(config)
+        with db._connection() as conn, conn.cursor() as cur:
+            cur.execute("""
+                SELECT du.device_user_id,
+                       COALESCE(s.name, du.name),
+                       COALESCE(s.designation, du.role, 'Normal User'),
+                       du.card_no,
+                       (s.id IS NOT NULL)
+                FROM biometric_device_users du
+                LEFT JOIN biometric_devices d ON d.serial_no = du.device_serial
+                LEFT JOIN biometric_enrollments be
+                  ON be.device_id = d.id
+                 AND be.device_user_id = du.device_user_id
+                 AND be.ignored = false
+                LEFT JOIN staff s ON s.id = be.staff_id
+                WHERE du.device_serial = %s
+                ORDER BY du.device_user_id
+            """, (clean_sn,))
+            for pin, name, role, card, mapped in cur.fetchall():
+                users.append({
+                    "uid": None, "userId": str(pin), "name": name or f"User {pin}",
+                    "privilege": None, "roleLabel": role or "Normal User", "card": card or "",
+                    "fingerCount": 0, "fingerFids": [], "fingerCountKnown": False,
+                    "mappedToLms": bool(mapped),
+                })
+    except Exception:
+        pass
+
+    if not users:
+        # Standalone ADMS mode, or a just-received USERINFO payload that has
+        # not reached Postgres yet, still has the per-device memory cache.
+        for pin, info in DEVICE_USER_CACHE.items():
+            if str(info.get("deviceSerial") or "").upper() != clean_sn:
+                continue
+            users.append({
+                "uid": None, "userId": str(pin), "name": info.get("name") or f"User {pin}",
+                "privilege": info.get("privilege"), "roleLabel": info.get("role", "Normal User"),
+                "card": info.get("card", ""), "fingerCount": 0, "fingerFids": [],
+                "fingerCountKnown": False, "mappedToLms": False,
+            })
+    return users
+
+
 def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None):
     """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
     try:
@@ -698,6 +748,8 @@ def parse_userinfo(body_str: str, sn: str):
         pin = None
         name = None
         role = "Normal User"
+        privilege = 0
+        card = ""
 
         # Key=Value format: PIN=2\tName=Deepak\tPri=0
         if "PIN=" in line.upper() or "NAME=" in line.upper():
@@ -713,8 +765,9 @@ def parse_userinfo(body_str: str, sn: str):
             pin = str(kv.get("PIN") or kv.get("USERID") or "")
             name = kv.get("NAME")
             try:
-                pri = int(kv.get("PRI") or kv.get("PRIVILEGE") or 0)
-                role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+                privilege = int(kv.get("PRI") or kv.get("PRIVILEGE") or 0)
+                role = "Super Admin" if privilege == 14 else ("Manager" if privilege == 2 else "Normal User")
+                card = str(kv.get("CARD") or "")
             except Exception:
                 pass
         else:
@@ -725,15 +778,19 @@ def parse_userinfo(body_str: str, sn: str):
                 name = parts[1]
                 if len(parts) > 4:
                     try:
-                        pri = int(parts[4])
-                        role = "Super Admin" if pri == 14 else ("Manager" if pri == 2 else "Normal User")
+                        privilege = int(parts[4])
+                        role = "Super Admin" if privilege == 14 else ("Manager" if privilege == 2 else "Normal User")
+                        card = parts[3] if len(parts) > 3 else ""
                     except Exception:
                         pass
 
         if pin and name:
             DEVICE_USER_CACHE[pin] = {
                 "name": name,
-                "role": role
+                "role": role,
+                "deviceSerial": str(sn).strip().upper(),
+                "privilege": privilege,
+                "card": card,
             }
             save_device_user_db(sn, pin, name, role)
             # Update any existing logs in memory that were waiting for this name
