@@ -376,14 +376,14 @@ async def api_transfer_single_user(request: Request) -> JSONResponse:
                 cur.execute("""
                     INSERT INTO biometric_device_users (device_serial, device_user_id, name, role)
                     VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (device_serial, device_user_id) 
+                    ON CONFLICT (device_serial, device_user_id)
                     DO UPDATE SET name = EXCLUDED.name, updated_at = now();
                 """, (target_id, actual_target_pin, name_val, "Normal User"))
 
                 # If move mode, remove from source device
                 if mode == "move":
                     cur.execute("""
-                        DELETE FROM biometric_device_users 
+                        DELETE FROM biometric_device_users
                         WHERE (device_serial = %s OR device_serial IS NULL) AND device_user_id = %s;
                     """, (source_id, user_id))
         except Exception as db_err:

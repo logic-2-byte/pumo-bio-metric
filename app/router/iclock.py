@@ -247,8 +247,8 @@ def get_user_info(user_id: str) -> dict:
         with db._connection() as conn, conn.cursor() as cur:
             # 1. Check persistent biometric_device_users table
             cur.execute("""
-                SELECT name, role FROM biometric_device_users 
-                WHERE device_user_id = %s 
+                SELECT name, role FROM biometric_device_users
+                WHERE device_user_id = %s
                 ORDER BY updated_at DESC LIMIT 1
             """, (u_id,))
             row = cur.fetchone()
@@ -282,7 +282,7 @@ def get_user_info(user_id: str) -> dict:
     return DEVICE_USER_CACHE.get(u_id, {"name": f"User {u_id}", "role": "Normal User"})
 
 
-def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str = None):
+def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None):
     """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
     try:
         from app.sync.config import config
@@ -300,9 +300,9 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
                 INSERT INTO biometric_device_users (device_serial, device_user_id, name, role, card_no, updated_at)
                 VALUES (%s, %s, %s, %s, %s, now())
                 ON CONFLICT (device_serial, device_user_id)
-                DO UPDATE SET 
-                    name = EXCLUDED.name, 
-                    role = EXCLUDED.role, 
+                DO UPDATE SET
+                    name = EXCLUDED.name,
+                    role = EXCLUDED.role,
                     card_no = COALESCE(EXCLUDED.card_no, biometric_device_users.card_no),
                     updated_at = now();
             """, (clean_sn, clean_pin, clean_name, clean_role, str(card) if card else None))
@@ -311,8 +311,8 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
             cur.execute("""
                 UPDATE biometric_punch_log
                 SET user_name = %s
-                WHERE (device_serial = %s OR %s = 'UNKNOWN') 
-                  AND device_user_id = %s 
+                WHERE (device_serial = %s OR %s = 'UNKNOWN')
+                  AND device_user_id = %s
                   AND (user_name IS NULL OR user_name LIKE 'User %%' OR user_name = '');
             """, (clean_name, clean_sn, clean_sn, clean_pin))
             conn.commit()
