@@ -44,6 +44,27 @@ def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
     return cmd_str
 
 
+def queue_targeted_userinfo_refresh(sn: str, pin: str) -> None:
+    """Ask for one specific PIN's profile, unless that exact ask is already in flight.
+
+    Some eSSL/ZKTeco firmware silently ignores a bulk `DATA QUERY USERINFO`. A
+    per-PIN query is more likely to be honored, but must not be re-queued on
+    every single punch while the device has not yet answered the last one.
+    """
+    clean_sn = str(sn or "").strip().upper()
+    clean_pin = str(pin or "").strip()
+    if not clean_sn or not clean_pin:
+        return
+    command_body = f"DATA QUERY USERINFO PIN={clean_pin}"
+    in_flight = any(
+        cmd.get("sn") == clean_sn and cmd.get("command") == command_body
+        and cmd.get("status") in {"queued", "dispatched"}
+        for cmd in COMMAND_TRACKING.values()
+    )
+    if not in_flight:
+        queue_device_cmd(clean_sn, command_body)
+
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 LOGS_FILE = os.path.join(BASE_DIR, "attendance_logs.json")
 USER_NAMES_FILE = os.path.join(BASE_DIR, "user_names.json")
@@ -211,15 +232,7 @@ def prune_punch_logs(days: int = HISTORY_DAYS) -> None:
 prune_punch_logs()
 
 # Persistent custom user names store
-DEVICE_USER_CACHE: dict[str, dict] = {
-    "1": {"name": "Admin / User 1", "role": "Super Admin"},
-    "2": {"name": "User 2", "role": "Normal User"},
-    "101": {"name": "Member 101", "role": "Normal User"},
-    "102": {"name": "Member 102", "role": "Normal User"},
-    "111": {"name": "ARULAJAY", "role": "Super Admin"},
-    "8888": {"name": "Device Manager", "role": "Manager"},
-    "9999": {"name": "Master Super Admin", "role": "Super Admin"},
-}
+DEVICE_USER_CACHE: dict[str, dict] = {}
 
 if os.path.exists(USER_NAMES_FILE):
     try:
@@ -386,55 +399,79 @@ def get_local_ips() -> list[str]:
     return ips if ips else ["127.0.0.1"]
 
 
-def get_user_info(user_id: str) -> dict:
-    """Resolve a PIN, preferring its authoritative LMS staff mapping."""
+_UNRESOLVED_NAME_WARNED: set[tuple[str | None, str]] = set()
+
+# Surfaced on the Devices & Support dashboard tab (see /api/devices) so a DB
+# permission or connectivity problem is visible there instead of only in the
+# console — this process cannot fix its own database grants, but support
+# should not have to read logs to find out one is missing.
+_LAST_DB_ERROR: dict | None = None
+
+
+def get_user_info(user_id: str, device_serial: str | None = None) -> dict:
+    """Resolve a PIN's name from what the device itself has told us.
+
+    The `biometric_bridge` DB role is deliberately denied access to
+    `biometric_enrollments`/`staff` (see deploy/lms_bridge_role.sql) — who a PIN
+    belongs to is the LMS's decision, not this bridge's. Querying those tables
+    here always fails in production; `biometric_device_users` (populated from a
+    device's own USERINFO push) is the only name source this service can read.
+
+    Multiple branches' devices can share one running instance of this service,
+    and PINs are only unique per device — branch A's PIN 4 and branch B's PIN 4
+    are different people. `device_serial`, when given, keeps this from ever
+    handing back another device's employee under the same PIN.
+    """
+    global _LAST_DB_ERROR
     u_id = str(user_id).strip()
+    clean_sn = str(device_serial).strip().upper() if device_serial else None
     try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
-            # A staff enrolment is the LMS mapping and must win over the name
-            # typed on a device. This is what keeps historical imports correct
-            # after a reader is renamed or reused.
-            cur.execute("""
-                SELECT s.name, s.designation
-                FROM biometric_enrollments be
-                JOIN staff s ON be.staff_id = s.id
-                WHERE be.device_user_id = %s AND be.ignored = false
-                LIMIT 1
-            """, (u_id,))
-            row = cur.fetchone()
-            if row and row[0]:
-                info = {"name": row[0].strip(), "role": row[1] or "Staff", "designation": row[1] or ""}
-                DEVICE_USER_CACHE[u_id] = info
-                save_user_cache()
-                return info
-
             # An unmapped PIN remains a device user, so its history is stored
             # and can be mapped later instead of being thrown away.
             cur.execute("""
                 SELECT name, role FROM biometric_device_users
-                WHERE device_user_id = %s
+                WHERE device_user_id = %s AND (%s IS NULL OR device_serial = %s)
                 ORDER BY updated_at DESC LIMIT 1
-            """, (u_id,))
+            """, (u_id, clean_sn, clean_sn))
             row = cur.fetchone()
+            _LAST_DB_ERROR = None
             if row and row[0]:
-                info = {"name": row[0].strip(), "role": row[1] or "Normal User"}
+                info = {"name": row[0].strip(), "role": row[1] or "Normal User", "deviceSerial": clean_sn}
                 DEVICE_USER_CACHE[u_id] = info
                 save_user_cache()
+                _UNRESOLVED_NAME_WARNED.discard((clean_sn, u_id))
                 return info
-    except Exception:
-        pass
+    except Exception as exc:
+        _LAST_DB_ERROR = {"message": str(exc).strip(), "at": datetime.now().isoformat()}
+        if (clean_sn, u_id) not in _UNRESOLVED_NAME_WARNED:
+            print(f"\033[1;31m[User Lookup]\033[0m biometric_device_users query failed for PIN {u_id}: {exc}")
 
     cached = DEVICE_USER_CACHE.get(u_id)
     if cached and cached.get("name") and not cached["name"].startswith("User "):
-        return cached
+        cached_sn = cached.get("deviceSerial")
+        # An untagged (legacy) entry is trusted as before; a tagged one must
+        # match this device, so it never answers for the wrong branch.
+        if not cached_sn or not clean_sn or cached_sn == clean_sn:
+            return cached
+
+    if (clean_sn, u_id) not in _UNRESOLVED_NAME_WARNED:
+        _UNRESOLVED_NAME_WARNED.add((clean_sn, u_id))
+        print(f"\033[1;33m[User Lookup]\033[0m No known name for PIN {u_id}"
+              f"{f' on device {clean_sn}' if clean_sn else ''} yet; showing placeholder "
+              f"until the device answers a USERINFO query.")
     return {"name": f"User {u_id}", "role": "Normal User"}
 
 
 def get_adms_device_users(sn: str) -> list[dict]:
-    """List users learned from one ADMS reader, without dialing its TCP port."""
+    """List users learned from one ADMS reader, without dialing its TCP port.
+
+    Reads only `biometric_device_users` — see the docstring on `get_user_info`
+    for why `biometric_enrollments`/`staff` are not queried here.
+    """
     clean_sn = str(sn or "").strip().upper()
     users: list[dict] = []
     try:
@@ -443,27 +480,17 @@ def get_adms_device_users(sn: str) -> list[dict]:
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
             cur.execute("""
-                SELECT du.device_user_id,
-                       COALESCE(s.name, du.name),
-                       COALESCE(s.designation, du.role, 'Normal User'),
-                       du.card_no,
-                       (s.id IS NOT NULL)
-                FROM biometric_device_users du
-                LEFT JOIN biometric_devices d ON d.serial_no = du.device_serial
-                LEFT JOIN biometric_enrollments be
-                  ON be.device_id = d.id
-                 AND be.device_user_id = du.device_user_id
-                 AND be.ignored = false
-                LEFT JOIN staff s ON s.id = be.staff_id
-                WHERE du.device_serial = %s
-                ORDER BY du.device_user_id
+                SELECT device_user_id, name, role, card_no
+                FROM biometric_device_users
+                WHERE device_serial = %s
+                ORDER BY device_user_id
             """, (clean_sn,))
-            for pin, name, role, card, mapped in cur.fetchall():
+            for pin, name, role, card in cur.fetchall():
                 users.append({
                     "uid": None, "userId": str(pin), "name": name or f"User {pin}",
                     "privilege": None, "roleLabel": role or "Normal User", "card": card or "",
                     "fingerCount": 0, "fingerFids": [], "fingerCountKnown": False,
-                    "mappedToLms": bool(mapped),
+                    "mappedToLms": False,
                 })
     except Exception:
         pass
@@ -537,7 +564,7 @@ def format_punch_banner(punch: dict, client_ip: str = "") -> str:
     verify_code = str(punch.get("verifyType", "1"))
     verify_label = VERIFY_MODES.get(verify_code, f"Type ({verify_code})")
 
-    user_info = get_user_info(user_id)
+    user_info = get_user_info(user_id, sn)
     user_name = punch.get("userName") or user_info.get("name", f"User {user_id}")
     user_role = punch.get("userRole") or user_info.get("role", "Normal User")
 
@@ -560,7 +587,7 @@ def format_punch_banner(punch: dict, client_ip: str = "") -> str:
 def broadcast_punch(punch: dict):
     """Broadcast new punch to all connected SSE clients and persist to local JSON file."""
     user_id = str(punch.get("userId", "")).strip()
-    user_info = get_user_info(user_id)
+    user_info = get_user_info(user_id, punch.get("sn"))
 
     if not punch.get("userName") or punch.get("userName", "").startswith("User "):
         if user_info.get("name") and not user_info.get("name").startswith("User "):
@@ -628,7 +655,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
             pin = str(kv_dict.get("PIN") or kv_dict.get("USERID") or kv_dict.get("ID") or "")
             ts_str = kv_dict.get("TIME") or kv_dict.get("TIMESTAMP") or kv_dict.get("DATETIME")
             if pin and ts_str:
-                user_info = get_user_info(pin)
+                user_info = get_user_info(pin, sn)
                 parsed_records.append({
                     "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
                     "sn": sn or "UNKNOWN",
@@ -656,7 +683,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
             verify_val = parts[3] if len(parts) > 3 and parts[3] != "" else "1"
             work_val = parts[4] if len(parts) > 4 and parts[4] != "" else "0"
 
-            user_info = get_user_info(pin)
+            user_info = get_user_info(pin, sn)
             parsed_records.append({
                 "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
                 "sn": sn or "UNKNOWN",
@@ -681,7 +708,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
             verify_val = space_parts[4] if len(space_parts) > 4 else "1"
             work_val = space_parts[5] if len(space_parts) > 5 else "0"
 
-            user_info = get_user_info(pin)
+            user_info = get_user_info(pin, sn)
             parsed_records.append({
                 "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
                 "sn": sn or "UNKNOWN",
@@ -701,7 +728,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
         comma_parts = [p.strip() for p in line.split(",") if p.strip()]
         if len(comma_parts) >= 2 and (("-" in comma_parts[1] or "/" in comma_parts[1]) or ":" in comma_parts[1]):
             pin = str(comma_parts[0])
-            user_info = get_user_info(pin)
+            user_info = get_user_info(pin, sn)
             parsed_records.append({
                 "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
                 "sn": sn or "UNKNOWN",
@@ -719,7 +746,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
 
         # 5. Raw Fallback
         pin = str(parts[0]) if parts else "DEVICE_USER"
-        user_info = get_user_info(pin)
+        user_info = get_user_info(pin, sn)
         parsed_records.append({
             "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
             "sn": sn or "UNKNOWN",
@@ -835,12 +862,35 @@ def parse_oplog(body_str: str, sn: str):
         if "PIN=" in line.upper() and "NAME=" in line.upper():
             discovered += parse_userinfo(line, sn)
             continue
+
+        # Biometric template capture lines look like "FP PIN=1\tFID=6\tSize=1116"
+        # — an enrollment event, not a plain admin action. The PIN is embedded
+        # inside the first field, not the field itself; without this, the tab
+        # split below records the operator as the literal string "FP PIN=1"
+        # and looks it up as if that were a real PIN.
+        template_match = re.match(r"^(FP|FACE|BIO|PALM)\s+PIN=(\S+)", line, re.IGNORECASE)
+        if template_match:
+            modality = template_match.group(1).upper()
+            operator_pin = template_match.group(2).strip()
+            rest = line[template_match.end():].strip()
+            # TMP= carries the raw biometric template as a base64 blob, often
+            # over a thousand characters. It has no diagnostic value in a
+            # console log, floods it, and writes biometric data to disk in
+            # the clear — keep the rest of the line, drop only the payload.
+            rest = re.sub(r"\bTMP=\S+", "TMP=<omitted>", rest, flags=re.IGNORECASE)
+            rest = rest.replace("\t", " | ")
+            user_info = get_user_info(operator_pin, sn)
+            op_name = user_info.get("name", f"User {operator_pin}")
+            print(f"\033[1;35m[iClock Biometric Enrollment]\033[0m Device: {sn} | User: {op_name} (PIN: {operator_pin}) "
+                  f"| Type: {modality} | {rest}")
+            continue
+
         parts = line.split("\t")
         if len(parts) >= 3:
             operator_pin = str(parts[0]).strip()
             op_type = parts[1]
             op_time = parts[2]
-            user_info = get_user_info(operator_pin)
+            user_info = get_user_info(operator_pin, sn)
             op_name = user_info.get("name", f"Admin {operator_pin}")
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Admin: {op_name} (ID: {operator_pin}) | OpType: {op_type} | Time: {op_time}")
         else:
@@ -1085,7 +1135,7 @@ async def sync_device_punches(request: Request) -> JSONResponse:
         if (uid_str, ts_str) in existing_keys:
             continue
 
-        user_info = get_user_info(uid_str)
+        user_info = get_user_info(uid_str, sn)
         punch_obj = {
             "id": f"{int(time.time() * 1000)}-{secrets.token_hex(3)}",
             "sn": sn,
@@ -1227,7 +1277,9 @@ async def get_device_status(sn: str):
         return {"status": "offline", "last_seen": None, "sn": sn}
 
     diff = time.time() - last_seen_time
-    is_online = diff < 120
+    # Same window as adms_last_seen()/probe_device_connection()/fetch_device_users
+    # — one definition of "online" everywhere, instead of a second ad hoc cutoff.
+    is_online = diff < ADMS_ONLINE_WINDOW_SECONDS
     return {
         "status": "online" if is_online else "offline",
         "last_seen": datetime.fromtimestamp(last_seen_time).isoformat(),
@@ -1244,6 +1296,60 @@ async def get_onboarding_status(sn: str):
     if not jobs:
         return JSONResponse(status_code=404, content={"ok": False, "error": "No onboarding job for this device"})
     return {"ok": True, "job": max(jobs, key=lambda item: item.get("createdAt", ""))}
+
+
+@router.get("/api/devices")
+async def list_devices_overview():
+    """One row per known device — everything support needs without reading logs.
+
+    Built entirely from this process's own state (registry, onboarding jobs,
+    command tracking, learned users); nothing here dials a device.
+    """
+    devices = []
+    for sn, info in DEVICE_REGISTRY.items():
+        jobs_for_sn = [j for j in ADMS_IMPORT_JOBS.values() if j.get("sn") == sn]
+        latest_job = max(jobs_for_sn, key=lambda j: j.get("createdAt", "")) if jobs_for_sn else None
+        users = get_adms_device_users(sn)
+        unresolved = sum(1 for u in users if str(u.get("name", "")).startswith("User "))
+        pending_commands = sum(
+            1 for cmd in COMMAND_TRACKING.values()
+            if cmd.get("sn") == sn and cmd.get("status") in {"queued", "dispatched"}
+        )
+        devices.append({
+            "sn": sn,
+            "name": info.get("name") or sn,
+            "ip": info.get("ip"),
+            "lastSeen": info.get("lastSeen"),
+            "online": bool(adms_last_seen(sn)),
+            "onboarding": {
+                "status": latest_job.get("status"),
+                "usersReceived": latest_job.get("usersReceived", 0),
+                "punchesReceived": latest_job.get("punchesReceived", 0),
+                "punchesStored": latest_job.get("punchesStored", 0),
+                "duplicates": latest_job.get("duplicates", 0),
+            } if latest_job else None,
+            "userCount": len(users),
+            "unresolvedNames": unresolved,
+            "pendingCommands": pending_commands,
+        })
+    devices.sort(key=lambda d: d["sn"])
+    return {"ok": True, "devices": devices, "dbWarning": _LAST_DB_ERROR}
+
+
+@router.get("/api/device/commands")
+async def get_device_commands(sn: str, limit: int = 30):
+    """Recent ADMS command history for one device — what's queued, dispatched,
+    acknowledged or failed, newest first. Support's window into create/delete
+    and onboarding commands without reading the process console.
+    """
+    clean_sn = str(sn or "").strip().upper()
+    commands = [
+        {"id": cmd_id, **cmd}
+        for cmd_id, cmd in COMMAND_TRACKING.items()
+        if cmd.get("sn") == clean_sn
+    ]
+    commands.sort(key=lambda c: c.get("queuedAt", ""), reverse=True)
+    return {"ok": True, "sn": clean_sn, "commands": commands[:max(1, limit)]}
 
 
 # ==========================================
@@ -1334,13 +1440,18 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
     new_punches = parse_attlog(body_str, sn)
     if new_punches:
-        has_unknown = any(
-            str(p.get("userId", "")).strip() not in DEVICE_USER_CACHE
-            or DEVICE_USER_CACHE[str(p.get("userId", "")).strip()].get("name", "").startswith("User ")
+        unresolved_pins = {
+            str(p.get("userId", "")).strip()
             for p in new_punches
-        )
-        if has_unknown:
+            if str(p.get("userId", "")).strip() not in DEVICE_USER_CACHE
+            or DEVICE_USER_CACHE[str(p.get("userId", "")).strip()].get("name", "").startswith("User ")
+        }
+        if unresolved_pins:
+            # Bulk query first (cheap, works on firmware that supports it), then
+            # a per-PIN query for each one — some devices only answer that form.
             queue_device_cmd(sn, "DATA QUERY USERINFO")
+            for pin in unresolved_pins:
+                queue_targeted_userinfo_refresh(sn, pin)
 
         for punch in new_punches:
             print(format_punch_banner(punch, client_ip))

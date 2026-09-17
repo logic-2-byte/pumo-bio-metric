@@ -5,11 +5,25 @@ The bridge that actually moves punches into the LMS is started by the lifespan
 in `app.core.manager`; see `app.sync` for what it does.
 """
 
+import sys
+from contextlib import suppress
 from pathlib import Path
+
+# The punch banners and status lines throughout app.router.iclock print emoji
+# and box-drawing characters. Linux (production) defaults to a UTF-8 locale,
+# but a Windows console defaults to a legacy codepage (cp1252) that cannot
+# encode them — print() then raises UnicodeEncodeError, which crashes the
+# request handler mid-response. A device that gets a 500 instead of "OK" for
+# a push it will never resend is worse than a mangled console character, so
+# this widens what the console will accept instead of erroring.
+for _stream in (sys.stdout, sys.stderr):
+    with suppress(Exception):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
+from starlette.requests import ClientDisconnect
 
 from app.core.logger import setup_logger
 from app.core.manager import lifespan
@@ -47,7 +61,17 @@ async def log_incoming_requests(request: Request, call_next):
         query = f"?{request.url.query}" if request.url.query else ""
         print(f"\033[1;90m[HTTP {request.method}]\033[0m "
               f"\033[1;36m{client_ip}\033[0m -> \033[1;97m{path}{query}\033[0m")
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    except ClientDisconnect:
+        # A reader on a flaky branch link (or one that reboots mid-push) can
+        # hang up before its own request finishes. There is nothing left to
+        # answer at that point, and no device to retry against — the
+        # alternative is an unhandled 500-level crash logged for every one of
+        # these, which is routine on this kind of link and not actionable.
+        client_ip = request.client.host if request.client else "unknown"
+        print(f"\033[1;33m[Client Disconnected]\033[0m {client_ip} -> {path} hung up before the request finished")
+        return PlainTextResponse("", status_code=499)
 
 
 app.include_router(base_router)

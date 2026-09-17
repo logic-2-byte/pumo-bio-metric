@@ -1,3 +1,3 @@
 #!/bin/bash
-# Multi worker server
-gunicorn -k uvicorn.workers.UvicornWorker --workers=2 --bind=0.0.0.0:8000 --reload --timeout=300 app.main:app
+# Must stay one worker — see the comment at the top of gunicorn_config.py for why.
+gunicorn -c gunicorn_config.py app.main:app

@@ -480,6 +480,9 @@
         <button class="nav-tab" id="tab-btn-migration" onclick="switchTab('migration')">
           <span>🔄</span> Device Migration & Testing
         </button>
+        <button class="nav-tab" id="tab-btn-devices" onclick="switchTab('devices')">
+          <span>🛠️</span> Devices & Support
+        </button>
       </div>
     </header>
 
@@ -999,6 +1002,78 @@
 
     </div>
 
+    <!-- ================================================================= -->
+    <!-- TAB 4: DEVICES & SUPPORT                                          -->
+    <!-- What dev/support checks first: is a device online, is its 30-day -->
+    <!-- backfill done, are its user names resolved, are commands stuck.  -->
+    <!-- ================================================================= -->
+    <div id="tab-devices" class="tab-content">
+      <div id="devices-db-warning" style="display: none; background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 10px; padding: 14px 18px; margin-bottom: 18px;">
+        <div style="font-weight: 700; color: var(--danger); display: flex; align-items: center; gap: 8px;">⚠️ Database error — employee names cannot resolve</div>
+        <div id="devices-db-warning-msg" style="font-family: 'JetBrains Mono', monospace; font-size: 0.82rem; color: var(--text); margin-top: 6px;"></div>
+        <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 8px;">
+          Last seen <span id="devices-db-warning-time"></span>. If this says "permission denied", run
+          <code style="background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px;">deploy/lms_bridge_role.sql</code>'s
+          grants for <code style="background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px;">biometric_device_users</code>
+          against the production database as a superuser — this process cannot grant its own permissions.
+        </div>
+      </div>
+      <div class="table-container">
+        <div class="table-header">
+          <div>
+            <h2>Registered Devices (<span id="devices-count">0</span>)</h2>
+            <div style="font-size: 0.8rem; color: var(--text-muted);">
+              Everything below comes from this server's own state — nothing here dials a device.
+            </div>
+          </div>
+          <button class="btn btn-outline" onclick="loadDevicesOverview()">🔄 Refresh</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Serial</th>
+              <th>Name / IP</th>
+              <th>Status</th>
+              <th>Last Seen</th>
+              <th>30-Day Onboarding</th>
+              <th>Names Resolved</th>
+              <th>Pending Commands</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="devices-body">
+            <tr id="devices-empty-row"><td colspan="8" class="empty-state">Loading devices…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Modal: Device Command History (ADMS queue / dispatch / ack) -->
+  <div id="modal-device-commands" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Command History — <span id="dc-modal-sn">-</span></h3>
+        <button class="btn btn-outline" style="padding: 4px 8px;" onclick="closeDeviceCommandsModal()">✕</button>
+      </div>
+      <div class="modal-body">
+        <table>
+          <thead>
+            <tr>
+              <th>Queued</th>
+              <th>Command</th>
+              <th>Action</th>
+              <th>Status</th>
+              <th>Return</th>
+            </tr>
+          </thead>
+          <tbody id="dc-modal-body">
+            <tr><td colspan="5" class="empty-state">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -1011,6 +1086,112 @@
       if (tabId === 'employees') {
         loadEmployees();
       }
+      if (tabId === 'devices') {
+        loadDevicesOverview();
+      }
+    }
+
+    // =========================================================================
+    // TAB 4: DEVICES & SUPPORT
+    // =========================================================================
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = value == null ? '' : String(value);
+      return div.innerHTML;
+    }
+
+    function formatRelativeTime(isoString) {
+      if (!isoString) return 'Never';
+      const then = new Date(isoString).getTime();
+      if (Number.isNaN(then)) return isoString;
+      const seconds = Math.max(0, Math.floor((Date.now() - then) / 1000));
+      if (seconds < 60) return `${seconds}s ago`;
+      if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+      if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+      return `${Math.floor(seconds / 86400)}d ago`;
+    }
+
+    function onboardingSummary(onboarding) {
+      if (!onboarding) return '<span style="color: var(--text-muted);">Not started</span>';
+      const statusColor = { completed: 'var(--success)', failed: 'var(--danger)' }[onboarding.status] || 'var(--warning)';
+      return `<span style="color:${statusColor}; font-weight:600; text-transform: capitalize;">${escapeHtml(onboarding.status || 'unknown')}</span>` +
+        `<div style="color: var(--text-muted); font-size: 0.78rem; margin-top: 2px;">` +
+        `${onboarding.usersReceived || 0} users · ${onboarding.punchesStored || 0}/${onboarding.punchesReceived || 0} punches stored` +
+        (onboarding.duplicates ? ` · ${onboarding.duplicates} dup` : '') +
+        `</div>`;
+    }
+
+    async function loadDevicesOverview() {
+      const tbody = document.getElementById('devices-body');
+      try {
+        const resp = await fetch('/api/devices');
+        const data = await resp.json();
+        const devices = data.devices || [];
+        document.getElementById('devices-count').innerText = devices.length;
+
+        const warningBox = document.getElementById('devices-db-warning');
+        if (data.dbWarning) {
+          document.getElementById('devices-db-warning-msg').innerText = data.dbWarning.message;
+          document.getElementById('devices-db-warning-time').innerText = formatRelativeTime(data.dbWarning.at);
+          warningBox.style.display = 'block';
+        } else {
+          warningBox.style.display = 'none';
+        }
+
+        if (!devices.length) {
+          tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No devices have connected yet.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = devices.map(d => {
+          const statusClass = d.online ? 'status-ok' : 'status-err';
+          const statusLabel = d.online ? '● Online' : '○ Offline';
+          const resolved = d.userCount - d.unresolvedNames;
+          const namesColor = d.unresolvedNames > 0 ? 'var(--warning)' : 'var(--success)';
+          const pendingColor = d.pendingCommands > 0 ? 'var(--warning)' : 'var(--text-muted)';
+          return `<tr>
+            <td>${escapeHtml(d.sn)}</td>
+            <td>${escapeHtml(d.name)}<div style="color: var(--text-muted); font-size: 0.78rem;">${escapeHtml(d.ip || '')}</div></td>
+            <td><span class="device-status-badge ${statusClass}">${statusLabel}</span></td>
+            <td>${formatRelativeTime(d.lastSeen)}</td>
+            <td>${onboardingSummary(d.onboarding)}</td>
+            <td style="color: ${namesColor};">${resolved}/${d.userCount} resolved</td>
+            <td style="color: ${pendingColor};">${d.pendingCommands}</td>
+            <td><button class="btn btn-outline" style="padding: 5px 10px; font-size: 0.78rem;" onclick="openDeviceCommandsModal('${escapeHtml(d.sn)}')">View Commands</button></td>
+          </tr>`;
+        }).join('');
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="8" class="empty-state">Could not load devices: ${escapeHtml(err.message || err)}</td></tr>`;
+      }
+    }
+
+    async function openDeviceCommandsModal(sn) {
+      document.getElementById('dc-modal-sn').innerText = sn;
+      document.getElementById('modal-device-commands').classList.add('active');
+      const tbody = document.getElementById('dc-modal-body');
+      tbody.innerHTML = '<tr><td colspan="5" class="empty-state">Loading…</td></tr>';
+      try {
+        const resp = await fetch('/api/device/commands?sn=' + encodeURIComponent(sn));
+        const data = await resp.json();
+        const commands = data.commands || [];
+        if (!commands.length) {
+          tbody.innerHTML = '<tr><td colspan="5" class="empty-state">No commands recorded for this device yet.</td></tr>';
+          return;
+        }
+        const statusColors = { acknowledged: 'var(--success)', failed: 'var(--danger)', dispatched: 'var(--accent)', queued: 'var(--warning)' };
+        tbody.innerHTML = commands.map(c => `<tr>
+          <td>${formatRelativeTime(c.queuedAt)}</td>
+          <td style="max-width: 320px; white-space: normal;">${escapeHtml(c.command)}</td>
+          <td>${escapeHtml(c.action || '')}</td>
+          <td style="color: ${statusColors[c.status] || 'var(--text-muted)'}; text-transform: capitalize;">${escapeHtml(c.status)}</td>
+          <td>${c.returnCode != null ? escapeHtml(c.returnCode) : '—'}</td>
+        </tr>`).join('');
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="5" class="empty-state">Could not load commands: ${escapeHtml(err.message || err)}</td></tr>`;
+      }
+    }
+
+    function closeDeviceCommandsModal() {
+      document.getElementById('modal-device-commands').classList.remove('active');
     }
 
     // =========================================================================
@@ -1492,8 +1673,10 @@
       }
     }
 
-    // Auto-sync physical device every 8 seconds for continuous real-time capture
-    setInterval(() => syncPunchesFromDevice(true), 8000);
+    // Real-time capture arrives via ADMS push + the SSE stream below. The
+    // "Sync Machine Punches" button remains for an on-demand manual pull;
+    // it no longer runs on a timer, which used to dial one hardcoded device
+    // over TCP every 8 seconds even when nothing was reachable or relevant.
 
     // Connect SSE for Real-time Updates
     const evtSource = new EventSource('/events');

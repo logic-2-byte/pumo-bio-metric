@@ -597,6 +597,39 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
                 pass
 
 
+def _should_skip_direct_tcp(sn: str) -> bool:
+    """True when dialing this device over TCP is known to be pointless.
+
+    Either the deployment is configured ADMS-only (a cloud host that can never
+    reach a device's LAN, so the attempt is a guaranteed multi-second dead
+    end), or this specific device has recently proven reachable only through
+    ADMS push — the same signal `fetch_device_users()` already relies on.
+    """
+    from app.core.settings import settings
+    if settings.device_transport_mode == "adms_only":
+        return True
+    try:
+        from app.router.iclock import adms_last_seen
+        return bool(adms_last_seen(sn))
+    except Exception:
+        return False
+
+
+def _queue_create_user_command(sn: str, pin: str, clean_name: str, normalized_privilege: int,
+                                password: str, card: int) -> dict[str, Any]:
+    from app.router.iclock import queue_device_cmd
+    command = queue_device_cmd(
+        sn,
+        f"DATA UPDATE USERINFO PIN={pin}\tName={clean_name}\tPri={normalized_privilege}"
+        f"\tPasswd={password or ''!s}\tCard={int(card or 0)}\tGrp=1",
+    )
+    return {
+        "ok": True, "created": True, "queued": True, "simulated": False,
+        "device": sn, "userId": pin, "name": clean_name,
+        "message": f"User creation queued for device {sn}; it will run on the next device poll ({command})."
+    }
+
+
 def create_device_user(
     device_id: str,
     user_id: str,
@@ -646,6 +679,9 @@ def create_device_user(
             "message": f"Created user {pin} ({clean_name}) on simulated device {sn}."
         }
 
+    if _should_skip_direct_tcp(sn):
+        return _queue_create_user_command(sn, pin, clean_name, normalized_privilege, password, card)
+
     if not HAS_PYZK:
         return {"ok": False, "error": "The 'pyzk' package is not installed."}
 
@@ -677,6 +713,7 @@ def create_device_user(
                 "role": "Super Admin" if normalized_privilege == 14 else "Normal User",
                 "privilege": normalized_privilege,
                 "card": int(card or 0),
+                "deviceSerial": str(sn).strip().upper(),
             }
             save_user_cache()
             save_device_user_db(sn, pin, clean_name, DEVICE_USER_CACHE[pin]["role"], str(card or ""))
@@ -690,17 +727,7 @@ def create_device_user(
     except Exception as exc:
         logger.warning("Direct user creation failed for %s (%s); queueing ADMS command: %s", sn, ip, exc)
         try:
-            from app.router.iclock import queue_device_cmd
-            command = queue_device_cmd(
-                sn,
-                f"DATA UPDATE USERINFO PIN={pin}\tName={clean_name}\tPri={normalized_privilege}"
-                f"\tPasswd={password or ''!s}\tCard={int(card or 0)}\tGrp=1",
-            )
-            return {
-                "ok": True, "created": True, "queued": True, "simulated": False,
-                "device": sn, "userId": pin, "name": clean_name,
-                "message": f"User creation queued for device {sn}; it will run on the next device poll ({command})."
-            }
+            return _queue_create_user_command(sn, pin, clean_name, normalized_privilege, password, card)
         except Exception as queue_error:
             return {"ok": False, "device": sn, "userId": pin, "error": f"{exc}; queue failed: {queue_error}"}
     finally:
@@ -718,10 +745,16 @@ def create_device_user(
 def _remove_user_metadata(device_serial: str, user_id: str) -> None:
     """Remove the deleted profile from local name caches and the LMS device-user mirror."""
     pin = str(user_id).strip()
+    clean_sn = str(device_serial or "").strip().upper()
     try:
         from app.router.iclock import DEVICE_USER_CACHE, save_user_cache
-        DEVICE_USER_CACHE.pop(pin, None)
-        save_user_cache()
+        cached = DEVICE_USER_CACHE.get(pin)
+        # Same PIN can exist on another branch's device under a different
+        # cache entry; only drop it here if it actually belongs to this one
+        # (or predates per-device tagging).
+        if cached and (not cached.get("deviceSerial") or cached.get("deviceSerial") == clean_sn):
+            DEVICE_USER_CACHE.pop(pin, None)
+            save_user_cache()
     except Exception:
         pass
     try:
@@ -787,6 +820,39 @@ def delete_device_user_simulated(
     }
 
 
+def _queue_delete_user_commands(sn: str, user_id: str, delete_biometrics_only: bool) -> dict[str, Any]:
+    from app.router.iclock import queue_device_cmd
+    u_pin = str(user_id).strip()
+    if delete_biometrics_only:
+        c1 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+        c2 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+        return {
+            "ok": True,
+            "simulated": False,
+            "deleted": True,
+            "queued": True,
+            "biometricsOnly": True,
+            "device": sn,
+            "userId": u_pin,
+            "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
+        }
+    # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
+    c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
+    c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
+    c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
+    c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+    return {
+        "ok": True,
+        "simulated": False,
+        "deleted": True,
+        "queued": True,
+        "biometricsOnly": False,
+        "device": sn,
+        "userId": u_pin,
+        "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
+    }
+
+
 def delete_device_user_real(
     device_id: str,
     user_id: str,
@@ -800,6 +866,12 @@ def delete_device_user_real(
     sn = resolved["sn"]
     ip = ip_override if ip_override and "." in ip_override else resolved["ip"]
     port = resolved["port"]
+
+    if _should_skip_direct_tcp(sn):
+        result = _queue_delete_user_commands(sn, user_id, delete_biometrics_only)
+        if not delete_biometrics_only:
+            _remove_user_metadata(sn, str(user_id))
+        return result
 
     if not HAS_PYZK:
         return {"ok": False, "error": "The 'pyzk' package is not installed."}
@@ -880,36 +952,7 @@ def delete_device_user_real(
     except Exception as e:
         logger.warning("TCP socket port 4370 connect failed for device %s (%s). Falling back to ADMS Push protocol command queue: %s", sn, ip, e)
         try:
-            from app.router.iclock import queue_device_cmd
-            u_pin = str(user_id).strip()
-            if delete_biometrics_only:
-                c1 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-                c2 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
-                return {
-                    "ok": True,
-                    "simulated": False,
-                    "deleted": True,
-                    "queued": True,
-                    "biometricsOnly": True,
-                    "device": sn,
-                    "userId": u_pin,
-                    "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
-                }
-            # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
-            c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
-            c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
-            c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-            c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
-            return {
-                "ok": True,
-                "simulated": False,
-                "deleted": True,
-                "queued": True,
-                "biometricsOnly": False,
-                "device": sn,
-                "userId": u_pin,
-                "message": f"Complete user wipe commands queued for {sn} via ADMS push protocol ({c1}, {c2}, {c3}, {c4}). Machine will execute on next poll."
-            }
+            return _queue_delete_user_commands(sn, user_id, delete_biometrics_only)
         except Exception as q_err:
             logger.exception("Failed to queue ADMS push delete command: %s", q_err)
             return {"ok": False, "simulated": False, "device": sn, "userId": str(user_id), "error": str(e)}
