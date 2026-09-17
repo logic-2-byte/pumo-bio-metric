@@ -2,11 +2,33 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _heal_squashed_env() -> None:
+    """Unpack squashed single-line KEY=VALUE pairs if passed in ENV/ENV_TEST or bundled in LMS_DB_HOST."""
+    candidates = [
+        os.getenv("ENV", ""),
+        os.getenv("ENV_TEST", ""),
+        os.getenv("LMS_DB_HOST", ""),
+    ]
+    for text in candidates:
+        if text and "=" in text and (" " in text or "\n" in text):
+            for match in re.finditer(r"([A-Za-z0-9_]+)=([^\s]+)", text):
+                k, v = match.group(1), match.group(2)
+                if k not in os.environ or os.environ[k] == text:
+                    os.environ[k] = v
+            current_host = os.getenv("LMS_DB_HOST", "")
+            if " " in current_host:
+                os.environ["LMS_DB_HOST"] = current_host.split()[0]
+
+
+_heal_squashed_env()
 
 
 def _int(name: str, default: int) -> int:
