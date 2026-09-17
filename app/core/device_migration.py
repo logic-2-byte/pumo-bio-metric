@@ -497,9 +497,19 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
     # ADMS readers initiate all communication. If this reader recently called
     # us, scanning users must use the users it pushed to ADMS rather than wait
     # for an unreachable reverse TCP/4370 connection.
+    #
+    # _should_skip_direct_tcp() returns True when:
+    #   a) DEVICE_TRANSPORT_MODE=adms_only is set, OR
+    #   b) This device has been seen via ADMS push recently.
+    # In both cases we must NOT fall through to TCP — it will always time out.
+    adms_only = _should_skip_direct_tcp(target_sn)
+
     try:
         from app.router.iclock import (
-            COMMAND_TRACKING, adms_last_seen, get_adms_device_users, queue_device_cmd,
+            COMMAND_TRACKING,
+            adms_last_seen,
+            get_adms_device_users,
+            queue_device_cmd,
         )
         if adms_last_seen(target_sn):
             users_list = get_adms_device_users(target_sn)
@@ -533,7 +543,32 @@ def fetch_device_users(device_id: str, port: int = 4370, timeout: int = 5, simul
             }
     except Exception:
         # Keep legacy direct-TCP scanning available for readers not using ADMS.
-        pass
+        # But if we already know this is an ADMS-only device, do not fall
+        # through — TCP will always time out and confuse the user.
+        if adms_only:
+            return {
+                "ok": False,
+                "error": (
+                    f"Device {target_sn} is an ADMS push reader and has not connected yet. "
+                    "Wait for it to poll and then try again."
+                ),
+            }
+
+    # ----------------------------------------------------------------
+    # Direct TCP path — only reached for non-ADMS devices.
+    # ----------------------------------------------------------------
+    if adms_only:
+        # Safety net: should never be reached, but prevents a 30-second
+        # TCP timeout if the ADMS block returned without entering the
+        # try/except above for some unforeseen reason.
+        return {
+            "ok": False,
+            "error": (
+                f"Device {target_sn} uses ADMS push mode. "
+                "Direct TCP/4370 is not available. "
+                "Wait for the device to poll and scan again."
+            ),
+        }
 
     if not HAS_PYZK:
         return {"ok": False, "error": "The 'pyzk' package is not installed."}
@@ -617,12 +652,27 @@ def _should_skip_direct_tcp(sn: str) -> bool:
 
 def _queue_create_user_command(sn: str, pin: str, clean_name: str, normalized_privilege: int,
                                 password: str, card: int) -> dict[str, Any]:
-    from app.router.iclock import queue_device_cmd
+    from app.router.iclock import DEVICE_USER_CACHE, queue_device_cmd, save_device_user_db, save_user_cache
     command = queue_device_cmd(
         sn,
         f"DATA UPDATE USERINFO PIN={pin}\tName={clean_name}\tPri={normalized_privilege}"
         f"\tPasswd={password or ''!s}\tCard={int(card or 0)}\tGrp=1",
+        priority=True,
     )
+    role = "Super Admin" if normalized_privilege == 14 else "Normal User"
+    DEVICE_USER_CACHE[pin] = {
+        "name": clean_name,
+        "role": role,
+        "privilege": normalized_privilege,
+        "card": int(card or 0),
+        "deviceSerial": str(sn).strip().upper(),
+    }
+    save_user_cache()
+    try:
+        save_device_user_db(sn, pin, clean_name, role, str(card or ""))
+    except Exception:
+        pass
+
     return {
         "ok": True, "created": True, "queued": True, "simulated": False,
         "device": sn, "userId": pin, "name": clean_name,
@@ -821,11 +871,11 @@ def delete_device_user_simulated(
 
 
 def _queue_delete_user_commands(sn: str, user_id: str, delete_biometrics_only: bool) -> dict[str, Any]:
-    from app.router.iclock import queue_device_cmd
+    from app.router.iclock import DEVICE_USER_CACHE, queue_device_cmd, save_user_cache
     u_pin = str(user_id).strip()
     if delete_biometrics_only:
-        c1 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-        c2 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+        c1 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}", priority=True)
+        c2 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}", priority=True)
         return {
             "ok": True,
             "simulated": False,
@@ -837,10 +887,13 @@ def _queue_delete_user_commands(sn: str, user_id: str, delete_biometrics_only: b
             "message": f"Biometric fingerprint wipe command queued for {sn} via ADMS push protocol ({c1}, {c2}). Machine will execute on next poll."
         }
     # eSSL / ZKTeco firmware requires USERINFO to wipe the entire user profile (name, PIN, card, password)
-    c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}")
-    c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}")
-    c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}")
-    c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}")
+    c1 = queue_device_cmd(sn, f"DATA DELETE USERINFO PIN={u_pin}", priority=True)
+    c2 = queue_device_cmd(sn, f"DATA DELETE USER PIN={u_pin}", priority=True)
+    c3 = queue_device_cmd(sn, f"DATA DELETE FINGERTMP PIN={u_pin}", priority=True)
+    c4 = queue_device_cmd(sn, f"DATA DELETE BIOPHOTO PIN={u_pin}", priority=True)
+    if u_pin in DEVICE_USER_CACHE:
+        del DEVICE_USER_CACHE[u_pin]
+        save_user_cache()
     return {
         "ok": True,
         "simulated": False,

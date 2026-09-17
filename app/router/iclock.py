@@ -27,20 +27,52 @@ ADMS_IMPORT_JOBS: dict[str, dict] = {}
 
 
 def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
-                     action: str | None = None) -> str:
+                     action: str | None = None, priority: bool = False) -> str:
     """Queue an ADMS command to be dispatched on the device's next /iclock/getrequest poll."""
     global _DEVICE_CMD_COUNTER
-    _DEVICE_CMD_COUNTER += 1
     clean_sn = str(sn or "").strip().upper()
-    cmd_str = f"C:{_DEVICE_CMD_COUNTER}:{cmd_body.strip()}"
-    DEVICE_COMMAND_QUEUE.setdefault(clean_sn, []).append(cmd_str)
+    clean_cmd = cmd_body.strip()
+    queue = DEVICE_COMMAND_QUEUE.setdefault(clean_sn, [])
+
+    # Deduplicate read queries (e.g. DATA QUERY USERINFO) so polls don't flood the queue
+    if clean_cmd.startswith("DATA QUERY"):
+        for existing in queue:
+            parts = existing.split(":", 2)
+            if len(parts) >= 3 and parts[2].strip() == clean_cmd:
+                return existing
+
+    _DEVICE_CMD_COUNTER += 1
+    cmd_str = f"C:{_DEVICE_CMD_COUNTER}:{clean_cmd}"
+
+    # Prioritization: mutations (DATA UPDATE, DATA DELETE, SET OPTION, REBOOT, CHECK)
+    # jump ahead of background polling queries so user actions take effect immediately.
+    is_mutation = (
+        priority
+        or clean_cmd.startswith(("DATA UPDATE", "DATA DELETE", "SET OPTION", "REBOOT", "CHECK"))
+    )
+
+    if is_mutation:
+        insert_idx = 0
+        for idx, existing in enumerate(queue):
+            parts = existing.split(":", 2)
+            body = parts[2].strip() if len(parts) >= 3 else ""
+            if body.startswith(("DATA UPDATE", "DATA DELETE", "SET OPTION", "REBOOT", "CHECK")):
+                insert_idx = idx + 1
+            else:
+                break
+        queue.insert(insert_idx, cmd_str)
+    else:
+        queue.append(cmd_str)
+
     COMMAND_TRACKING[str(_DEVICE_CMD_COUNTER)] = {
-        "sn": clean_sn, "command": cmd_body.strip(), "jobId": job_id,
-        "action": action or "command", "status": "queued",
+        "sn": clean_sn, "command": clean_cmd, "jobId": job_id,
+        "action": action or ("mutation" if is_mutation else "command"),
+        "status": "queued",
         "queuedAt": datetime.now().isoformat(),
     }
     save_adms_state()
-    print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str}")
+    pos = queue.index(cmd_str) + 1
+    print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str} (pos {pos}/{len(queue)})")
     return cmd_str
 
 
@@ -89,13 +121,36 @@ def save_adms_state() -> None:
         print(f"[ADMS State Warning] Could not persist command state: {exc}", flush=True)
 
 
+def _sanitize_device_queue(raw_queue: list[str]) -> list[str]:
+    """Deduplicate read queries and prioritize mutation commands."""
+    mutations: list[str] = []
+    queries: list[str] = []
+    seen_queries: set[str] = set()
+
+    for cmd in raw_queue:
+        parts = cmd.split(":", 2)
+        body = parts[2].strip() if len(parts) >= 3 else cmd.strip()
+        if body.startswith(("DATA UPDATE", "DATA DELETE", "SET OPTION", "REBOOT", "CHECK")):
+            mutations.append(cmd)
+        elif body.startswith("DATA QUERY"):
+            if body not in seen_queries:
+                seen_queries.add(body)
+                queries.append(cmd)
+        else:
+            mutations.append(cmd)
+
+    return mutations + queries
+
+
 def load_adms_state() -> None:
     global _DEVICE_CMD_COUNTER
     try:
         with open(ADMS_STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
         _DEVICE_CMD_COUNTER = max(_DEVICE_CMD_COUNTER, int(state.get("commandCounter", 1000)))
-        DEVICE_COMMAND_QUEUE.update({str(k).upper(): list(v) for k, v in state.get("queue", {}).items()})
+        raw_queue = {str(k).upper(): list(v) for k, v in state.get("queue", {}).items()}
+        for sn_key, q_list in raw_queue.items():
+            DEVICE_COMMAND_QUEUE[sn_key] = _sanitize_device_queue(q_list)
         COMMAND_TRACKING.update(state.get("commands", {}))
         ADMS_IMPORT_JOBS.update(state.get("jobs", {}))
     except FileNotFoundError:
@@ -498,15 +553,49 @@ def get_adms_device_users(sn: str) -> list[dict]:
     if not users:
         # Standalone ADMS mode, or a just-received USERINFO payload that has
         # not reached Postgres yet, still has the per-device memory cache.
+        #
+        # Also include entries with no deviceSerial tag (legacy enrollments
+        # captured before the serial-tagging code existed). These are better
+        # than nothing while the device hasn't yet answered a USERINFO query.
+        untagged: list[dict] = []
         for pin, info in DEVICE_USER_CACHE.items():
-            if str(info.get("deviceSerial") or "").upper() != clean_sn:
-                continue
-            users.append({
-                "uid": None, "userId": str(pin), "name": info.get("name") or f"User {pin}",
-                "privilege": info.get("privilege"), "roleLabel": info.get("role", "Normal User"),
-                "card": info.get("card", ""), "fingerCount": 0, "fingerFids": [],
-                "fingerCountKnown": False, "mappedToLms": False,
-            })
+            cached_sn = str(info.get("deviceSerial") or "").upper()
+            if cached_sn == clean_sn:
+                # Exact match — always include.
+                users.append({
+                    "uid": None, "userId": str(pin), "name": info.get("name") or f"User {pin}",
+                    "privilege": info.get("privilege"), "roleLabel": info.get("role", "Normal User"),
+                    "card": info.get("card", ""), "fingerCount": 0, "fingerFids": [],
+                    "fingerCountKnown": False, "mappedToLms": False,
+                })
+            elif not cached_sn:
+                # No serial tag — could belong to any device. Keep as fallback.
+                untagged.append({
+                    "uid": None, "userId": str(pin), "name": info.get("name") or f"User {pin}",
+                    "privilege": info.get("privilege"), "roleLabel": info.get("role", "Normal User"),
+                    "card": info.get("card", ""), "fingerCount": 0, "fingerFids": [],
+                    "fingerCountKnown": False, "mappedToLms": False,
+                })
+
+        # Only fall back to untagged entries when no device-specific entries
+        # were found. This avoids mixing multiple branches' caches together
+        # when at least one tagged entry establishes the real roster.
+        if not users and untagged:
+            users = untagged
+
+        # Seed the DB with whatever we found in the cache so future calls
+        # hit Postgres instead of the untagged fallback.
+        if users:
+            for u in users:
+                cached_info = DEVICE_USER_CACHE.get(u["userId"], {})
+                if cached_info.get("name") and not str(cached_info["name"]).startswith("User "):
+                    save_device_user_db(
+                        clean_sn, u["userId"],
+                        cached_info["name"],
+                        cached_info.get("role", "Normal User"),
+                        cached_info.get("card") or None,
+                    )
+
     return users
 
 
@@ -537,17 +626,28 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
                     card_no = COALESCE(EXCLUDED.card_no, biometric_device_users.card_no),
                     updated_at = now();
             """, (clean_sn, clean_pin, clean_name, clean_role, str(card) if card else None))
-
-            # Also retroactively update punches in biometric_punch_log that were recorded with 'User <pin>' or NULL
-            cur.execute("""
-                UPDATE biometric_punch_log
-                SET user_name = %s
-                WHERE (device_serial = %s OR %s = 'UNKNOWN')
-                  AND device_user_id = %s
-                  AND (user_name IS NULL OR user_name LIKE 'User %%' OR user_name = '');
-            """, (clean_name, clean_sn, clean_sn, clean_pin))
             conn.commit()
             print(f"\033[1;32m[DB Sync]\033[0m Persisted user {clean_pin} -> '{clean_name}' ({clean_role}) to biometric_device_users.", flush=True)
+
+        # Retroactively fix punches that were stored with a placeholder name.
+        # This is best-effort: if biometric_bridge lacks UPDATE on biometric_punch_log
+        # (the permission is column-scoped in V111), this block fails silently
+        # rather than rolling back the INSERT above.
+        try:
+            with db._connection() as conn, conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE biometric_punch_log
+                    SET device_user_name = %s
+                    WHERE (device_serial = %s OR %s = 'UNKNOWN')
+                      AND device_user_id = %s
+                      AND (device_user_name IS NULL OR device_user_name LIKE 'User %%' OR device_user_name = '');
+                """, (clean_name, clean_sn, clean_sn, clean_pin))
+                conn.commit()
+        except Exception as upd_exc:
+            # Non-fatal: the INSERT above already landed. This UPDATE requires
+            # the V111 migration (column-scoped UPDATE on biometric_punch_log).
+            print(f"\033[1;33m[DB Sync]\033[0m Retroactive punch name update skipped for {clean_pin}: {upd_exc}", flush=True)
+
     except Exception as exc:
         print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
 
