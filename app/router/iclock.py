@@ -64,15 +64,18 @@ def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
     else:
         queue.append(cmd_str)
 
+    from app.core.adms_transfer import redact_command
+    # Tracking is persisted and shown on the dashboard; a fingerprint write's
+    # template must be in the queue (the reader needs it) but nowhere else.
     COMMAND_TRACKING[str(_DEVICE_CMD_COUNTER)] = {
-        "sn": clean_sn, "command": clean_cmd, "jobId": job_id,
+        "sn": clean_sn, "command": redact_command(clean_cmd), "jobId": job_id,
         "action": action or ("mutation" if is_mutation else "command"),
         "status": "queued",
         "queuedAt": datetime.now().isoformat(),
     }
     save_adms_state()
     pos = queue.index(cmd_str) + 1
-    print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {cmd_str} (pos {pos}/{len(queue)})")
+    print(f"\033[1;35m[ADMS Command Queued]\033[0m For device {clean_sn}: {redact_command(cmd_str)} (pos {pos}/{len(queue)})")
     return cmd_str
 
 
@@ -89,6 +92,15 @@ _USERINFO_ASKED_FOR: dict[tuple[str, str], float] = {}
 
 def _is_placeholder_name(name: str | None) -> bool:
     return not name or str(name).startswith("User ")
+
+
+def _delete_in_flight(clean_sn: str, pin: str) -> bool:
+    command = f"DATA DELETE USERINFO PIN={pin}"
+    return any(
+        cmd.get("sn") == clean_sn and cmd.get("command") == command
+        and cmd.get("status") in {"queued", "dispatched"}
+        for cmd in COMMAND_TRACKING.values()
+    )
 
 
 def _userinfo_query_in_flight(clean_sn: str, now: float) -> bool:
@@ -282,6 +294,8 @@ def record_command_result(sn: str | None, body: str) -> None:
             else:
                 job["status"] = "receiving"
         save_adms_state()
+        from app.core.adms_transfer import on_command_result
+        on_command_result(command_id, result)
 
 
 load_adms_state()
@@ -676,6 +690,16 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
             conn.commit()
             print(f"\033[1;32m[DB Sync]\033[0m Persisted user {clean_pin} -> '{clean_name}' ({clean_role}) to biometric_device_users.", flush=True)
 
+        # The reader reports this PIN again, so it was re-enrolled: it is no
+        # longer "deleted" for the LMS (V112). Own block, so a missing table
+        # cannot undo the upsert above.
+        with suppress(Exception):
+            with db._connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM biometric_device_user_removals WHERE device_serial = %s AND device_user_id = %s",
+                    (clean_sn, clean_pin),
+                )
+
         # Retroactively fix punches that were stored with a placeholder name.
         # This is best-effort: if biometric_bridge lacks UPDATE on biometric_punch_log
         # (the permission is column-scoped in V111), this block fails silently
@@ -1009,11 +1033,17 @@ def parse_userinfo(body_str: str, sn: str):
         if pin and name:
             received += 1
             clean_sn = str(sn).strip().upper()
+            from app.core.adms_transfer import capture_profile
+            capture_profile(clean_sn, pin, name, privilege, card)
             record = (name, role, card)
             # A full USERINFO answer repeats every user on the reader. Only a
             # new or changed one is worth a DB upsert and punch back-fill —
             # otherwise 100 users x 20 readers is thousands of writes per pull.
             if _PERSISTED_DEVICE_USERS.get((clean_sn, pin)) == record:
+                continue
+            # Deletes are queued: an answer the reader sent before running the
+            # delete still lists the user, and must not bring them back.
+            if _delete_in_flight(clean_sn, pin):
                 continue
             DEVICE_USER_CACHE[pin] = {
                 "name": name,
@@ -1063,6 +1093,9 @@ def parse_oplog(body_str: str, sn: str):
         if template_match:
             modality = template_match.group(1).upper()
             operator_pin = template_match.group(2).strip()
+            if modality == "FP":
+                from app.core.adms_transfer import capture_template
+                capture_template(sn, operator_pin, line)
             rest = line[template_match.end():].strip()
             # TMP= carries the raw biometric template as a base64 blob, often
             # over a thousand characters. It has no diagnostic value in a
@@ -1724,7 +1757,8 @@ async def getrequest_handler(request: Request) -> PlainTextResponse:
             COMMAND_TRACKING[command_id]["status"] = "dispatched"
             COMMAND_TRACKING[command_id]["dispatchedAt"] = datetime.now().isoformat()
         save_adms_state()
-        print(f"\033[1;32m[Push Command Dispatched]\033[0m Machine: {clean_sn} -> {cmd}")
+        from app.core.adms_transfer import redact_command
+        print(f"\033[1;32m[Push Command Dispatched]\033[0m Machine: {clean_sn} -> {redact_command(cmd)}")
         return PlainTextResponse(cmd, media_type="text/plain")
 
     return PlainTextResponse("OK", media_type="text/plain")

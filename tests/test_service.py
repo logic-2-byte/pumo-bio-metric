@@ -305,6 +305,73 @@ def test_unchanged_users_are_not_rewritten_to_the_database(monkeypatch) -> None:
     assert len(db_saves) == 3
 
 
+def test_user_with_a_pending_delete_is_not_brought_back(monkeypatch) -> None:
+    """Deletes are queued; a USERINFO answer sent before the reader ran the
+    delete still lists the user and must not re-create them."""
+    db_saves: list = []
+    _isolate_adms_state(monkeypatch, db_saves)
+    sn = "NFZ8254900401"
+    iclock.queue_device_cmd(sn, "DATA DELETE USERINFO PIN=101")
+
+    iclock.parse_userinfo("USER PIN=101\tName=Testj\tPri=0\nUSER PIN=2\tName=Deepak\tPri=14", sn)
+
+    assert [save[1] for save in db_saves] == ["2"]
+    assert "101" not in iclock.DEVICE_USER_CACHE
+
+
+def _run_adms_transfer(monkeypatch, mode: str, target_return: str = "0"):
+    """Drive a transfer through the real device endpoints, as the two readers would."""
+    from app.core import adms_transfer
+
+    db_saves: list = []
+    _isolate_adms_state(monkeypatch, db_saves)
+    monkeypatch.setattr(adms_transfer, "TRANSFER_JOBS", {})
+    src, tgt = "SRCREADER01", "TGTREADER01"
+
+    started = adms_transfer.start_transfer(src, tgt, "3", mode, target_pin="3")
+    assert started["ok"] and started["queued"]
+    [query] = iclock.DEVICE_COMMAND_QUEUE[src]
+    assert query.endswith("DATA QUERY USERINFO")
+
+    # The source answers: profile, then fingerprints, then acknowledges.
+    client.post(f"/iclock/cdata?SN={src}&table=OPERLOG", content="USER PIN=3\tName=Aki\tPri=0\tCard=12345")
+    client.post(f"/iclock/cdata?SN={src}&table=OPERLOG",
+                content="FP PIN=3\tFID=6\tSize=8\tValid=1\tTMP=QUJDRA+/FID=9")
+    client.post(f"/iclock/devicecmd?SN={src}", content=f"ID={query.split(':')[1]}&Return=0&CMD=DATA")
+
+    writes = list(iclock.DEVICE_COMMAND_QUEUE[tgt])
+    for cmd in writes:
+        client.post(f"/iclock/devicecmd?SN={tgt}", content=f"ID={cmd.split(':')[1]}&Return={target_return}&CMD=DATA")
+    return adms_transfer.TRANSFER_JOBS[started["jobId"]], writes, db_saves, src, tgt
+
+
+def test_adms_copy_writes_profile_and_fingerprint_to_target(monkeypatch) -> None:
+    job, writes, db_saves, src, tgt = _run_adms_transfer(monkeypatch, "copy")
+
+    assert writes[0].endswith("DATA UPDATE USERINFO PIN=3\tName=Aki\tPri=0\tPasswd=\tCard=12345\tGrp=1")
+    # The template is carried whole, even where its base64 looks like a field.
+    assert writes[1].endswith("DATA UPDATE FINGERTMP PIN=3\tFID=6\tSize=8\tValid=1\tTMP=QUJDRA+/FID=9")
+    assert job["status"] == "completed" and job["fingersTransferred"] == 1
+    assert (tgt, "3", "Aki") in db_saves
+    assert not any("DATA DELETE" in c for c in iclock.DEVICE_COMMAND_QUEUE.get(src, []))  # copy leaves the source alone
+    # The template never reaches the persisted/displayed command history.
+    assert not any("QUJDRA" in c["command"] for c in iclock.COMMAND_TRACKING.values())
+
+
+def test_adms_move_removes_source_only_after_target_confirms(monkeypatch) -> None:
+    job, _, _, src, _ = _run_adms_transfer(monkeypatch, "move")
+
+    assert job["status"] == "completed"
+    assert any("DATA DELETE USERINFO PIN=3" in c for c in iclock.DEVICE_COMMAND_QUEUE[src])
+
+
+def test_adms_move_keeps_source_when_target_refuses(monkeypatch) -> None:
+    job, _, _, src, _ = _run_adms_transfer(monkeypatch, "move", target_return="-1")
+
+    assert job["status"] == "failed"
+    assert not any("DATA DELETE" in c for c in iclock.DEVICE_COMMAND_QUEUE.get(src, []))
+
+
 def test_unknown_pin_refresh_is_rate_limited(monkeypatch) -> None:
     _isolate_adms_state(monkeypatch)
     sn = "RATELIMIT01"

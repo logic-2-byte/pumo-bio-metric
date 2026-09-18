@@ -260,9 +260,15 @@ class MigrationResult:
     fingers_transferred: int = 0
     logs: list[str] = field(default_factory=list)
     error: str | None = None
+    # An ADMS transfer is accepted now and finished by the readers' next polls.
+    queued: bool = False
+    job_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "queued": self.queued,
+            "jobId": self.job_id,
+            "message": self.logs[-1] if self.logs else (self.error or ""),
             "ok": self.ok,
             "mode": self.mode,
             "userId": self.user_id,
@@ -808,16 +814,36 @@ def _remove_user_metadata(device_serial: str, user_id: str) -> None:
     except Exception:
         pass
     try:
+        from app.router.iclock import _PERSISTED_DEVICE_USERS
+        # Otherwise a re-enrolment under the same name would be skipped as
+        # "unchanged" and never written back.
+        _PERSISTED_DEVICE_USERS.pop((clean_sn, pin), None)
+    except Exception:
+        pass
+    try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
         db = LmsDatabase(config)
         with db._connection() as db_conn, db_conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM biometric_device_users WHERE device_serial = %s AND device_user_id = %s",
-                (device_serial, pin),
+                (clean_sn, pin),
             )
     except Exception as exc:
         logger.warning("Could not remove metadata for deleted device user %s/%s: %s", device_serial, pin, exc)
+        return
+    try:
+        # Tells the LMS this PIN is gone, so its stranded punches stop being
+        # listed as "belongs to nobody" (V112). Separate block: a failure here
+        # (table not migrated yet) must not undo the delete above.
+        with db._connection() as db_conn, db_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO biometric_device_user_removals (device_serial, device_user_id, removed_at)
+                VALUES (%s, %s, now())
+                ON CONFLICT (device_serial, device_user_id) DO UPDATE SET removed_at = now()
+            """, (clean_sn, pin))
+    except Exception as exc:
+        logger.warning("Could not record removal of %s/%s for the LMS: %s", clean_sn, pin, exc)
 
 
 def delete_device_user_simulated(
@@ -1640,7 +1666,38 @@ def run_migration(
         if is_sim:
             res = migrate_single_user_simulated(src_sn, tgt_sn, uid, mode, target_user_id=tgt_pin)
         else:
-            res = migrate_single_user_real(src_sn, source_port, tgt_sn, target_port, uid, mode, timeout, target_user_id=tgt_pin)
+            res = migrate_single_user(src_sn, source_port, tgt_sn, target_port, uid, mode, timeout,
+                                      target_user_id=tgt_pin)
         results.append(res.to_dict())
 
     return results
+
+
+def migrate_single_user(
+    source_id: str,
+    source_port: int,
+    target_id: str,
+    target_port: int,
+    user_id: str,
+    mode: str = "copy",
+    timeout: int = 8,
+    target_user_id: str | None = None,
+) -> MigrationResult:
+    """Transfer one user by whichever route the two readers can actually be reached on.
+
+    A reader that only talks ADMS cannot be dialled on 4370 — the TCP path just
+    times out, which is what every cloud-hosted transfer did — so if either end
+    is ADMS-only the transfer runs as a queued ADMS job instead.
+    """
+    src_sn = resolve_device(source_id, source_port)["sn"]
+    tgt_sn = resolve_device(target_id, target_port)["sn"]
+    if _should_skip_direct_tcp(src_sn) or _should_skip_direct_tcp(tgt_sn):
+        from app.core.adms_transfer import start_transfer
+        r = start_transfer(src_sn, tgt_sn, user_id, mode, target_pin=target_user_id)
+        return MigrationResult(
+            ok=r["ok"], mode=r["mode"], user_id=r["userId"], user_name=r["userName"],
+            source_ip=src_sn, target_ip=tgt_sn, target_user_id=r["targetUserId"],
+            logs=r["logs"], queued=True, job_id=r["jobId"],
+        )
+    return migrate_single_user_real(src_sn, source_port, tgt_sn, target_port, user_id, mode, timeout,
+                                    target_user_id=target_user_id)

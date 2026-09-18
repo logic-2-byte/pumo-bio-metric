@@ -364,7 +364,10 @@ async def api_transfer_single_user(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content={"ok": False, "error": "Migration produced no result"})
 
     res = results[0]
-    if res.get("ok"):
+    # A queued ADMS transfer updates the device-user rows itself once the target
+    # confirms — doing it here would drop the source row of a move that has not
+    # happened yet.
+    if res.get("ok") and not res.get("queued"):
         try:
             from app.sync.config import config
             from app.sync.lms_db import LmsDatabase
@@ -390,6 +393,13 @@ async def api_transfer_single_user(request: Request) -> JSONResponse:
             logger.warning("Could not sync biometric_device_users table after transfer: %s", db_err)
 
     return JSONResponse(status_code=200 if res.get("ok") else 400, content=res)
+
+
+@router.get("/jobs")
+async def api_transfer_jobs() -> JSONResponse:
+    """ADMS transfers in flight or recently finished, newest first (no template data)."""
+    from app.core.adms_transfer import list_jobs
+    return JSONResponse(content={"ok": True, "jobs": list_jobs()})
 
 
 @router.post("/resolve-pin")

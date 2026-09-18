@@ -17,7 +17,7 @@ from typing import Any
 from app.core.device_migration import (
     delete_device_user,
     get_registered_devices,
-    migrate_single_user_real,
+    migrate_single_user,
     migrate_single_user_simulated,
     resolve_target_pin,
 )
@@ -242,7 +242,7 @@ def transfer_employee(
                     target_user_id=target_pin
                 )
             else:
-                res = migrate_single_user_real(
+                res = migrate_single_user(
                     source_id=src_sn,
                     source_port=src_dev.get("port", 4370),
                     target_id=tgt_sn,
@@ -367,7 +367,7 @@ def grant_multi_branch_access(
             target_user_id=target_pin
         )
     else:
-        res = migrate_single_user_real(
+        res = migrate_single_user(
             source_id=src_sn,
             source_port=src_dev.get("port", 4370),
             target_id=tgt_sn,
