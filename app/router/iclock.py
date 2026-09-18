@@ -76,25 +76,61 @@ def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
     return cmd_str
 
 
-def queue_targeted_userinfo_refresh(sn: str, pin: str) -> None:
-    """Ask for one specific PIN's profile, unless that exact ask is already in flight.
+# A reader answers DATA QUERY USERINFO with its whole user table plus every
+# fingerprint template (~1.5 KB each). Asking whenever one PIN looked unknown
+# became a loop that re-pulled everything every few seconds; these bound it.
+USERINFO_DEVICE_COOLDOWN_SECONDS = 10 * 60
+USERINFO_PIN_RETRY_SECONDS = 6 * 60 * 60
+# A dispatched query the reader never acknowledges must not block refreshes forever.
+USERINFO_DISPATCH_STALE_SECONDS = 5 * 60
+_LAST_USERINFO_REFRESH: dict[str, float] = {}
+_USERINFO_ASKED_FOR: dict[tuple[str, str], float] = {}
 
-    Some eSSL/ZKTeco firmware silently ignores a bulk `DATA QUERY USERINFO`. A
-    per-PIN query is more likely to be honored, but must not be re-queued on
-    every single punch while the device has not yet answered the last one.
+
+def _is_placeholder_name(name: str | None) -> bool:
+    return not name or str(name).startswith("User ")
+
+
+def _userinfo_query_in_flight(clean_sn: str, now: float) -> bool:
+    for cmd in COMMAND_TRACKING.values():
+        if cmd.get("sn") != clean_sn or not str(cmd.get("command", "")).startswith("DATA QUERY USERINFO"):
+            continue
+        if cmd.get("status") == "queued":
+            return True
+        if cmd.get("status") == "dispatched":
+            with suppress(Exception):
+                if now - datetime.fromisoformat(cmd["dispatchedAt"]).timestamp() < USERINFO_DISPATCH_STALE_SECONDS:
+                    return True
+    return False
+
+
+def request_userinfo_refresh(sn: str, pins) -> bool:
+    """Ask a reader for its user table because these PINs have no known name.
+
+    This is the only automatic trigger for a user pull after onboarding, and it
+    is bounded three ways: never while a query is still being answered, at most
+    once per device per cooldown, and a PIN already asked about (whose reader
+    evidently has no name for it) is not asked about again for hours.
     """
     clean_sn = str(sn or "").strip().upper()
-    clean_pin = str(pin or "").strip()
-    if not clean_sn or not clean_pin:
-        return
-    command_body = f"DATA QUERY USERINFO PIN={clean_pin}"
-    in_flight = any(
-        cmd.get("sn") == clean_sn and cmd.get("command") == command_body
-        and cmd.get("status") in {"queued", "dispatched"}
-        for cmd in COMMAND_TRACKING.values()
-    )
-    if not in_flight:
-        queue_device_cmd(clean_sn, command_body)
+    now = time.time()
+    wanted = {
+        p for p in (str(pin or "").strip() for pin in pins)
+        if p and now - _USERINFO_ASKED_FOR.get((clean_sn, p), 0) >= USERINFO_PIN_RETRY_SECONDS
+    }
+    if not clean_sn or not wanted:
+        return False
+    if _userinfo_query_in_flight(clean_sn, now):
+        return False
+    if now - _LAST_USERINFO_REFRESH.get(clean_sn, 0) < USERINFO_DEVICE_COOLDOWN_SECONDS:
+        return False
+    _LAST_USERINFO_REFRESH[clean_sn] = now
+    for pin in wanted:
+        _USERINFO_ASKED_FOR[(clean_sn, pin)] = now
+    queue_device_cmd(clean_sn, "DATA QUERY USERINFO")
+    print(f"\033[1;36m[User Refresh]\033[0m {clean_sn}: asking for users because of unknown PIN(s) "
+          f"{', '.join(sorted(wanted))}")
+    return True
 
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
@@ -607,8 +643,11 @@ def get_adms_device_users(sn: str) -> list[dict]:
     return users
 
 
-def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None):
-    """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs."""
+def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User", card: str | None = None) -> bool:
+    """Persist user mapping to PostgreSQL biometric_device_users table and retroactively update punch logs.
+
+    Returns True once the user row is stored (the punch back-fill is best-effort).
+    """
     try:
         from app.sync.config import config
         from app.sync.lms_db import LmsDatabase
@@ -620,7 +659,7 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
         # real device user that may be mapped in the LMS later; only punch
         # display falls back until that mapping exists.
         if not clean_pin or not clean_name:
-            return
+            return False
 
         db = LmsDatabase(config)
         with db._connection() as conn, conn.cursor() as cur:
@@ -655,9 +694,11 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
             # Non-fatal: the INSERT above already landed. This UPDATE requires
             # the V111 migration (column-scoped UPDATE on biometric_punch_log).
             print(f"\033[1;33m[DB Sync]\033[0m Retroactive punch name update skipped for {clean_pin}: {upd_exc}", flush=True)
+        return True
 
     except Exception as exc:
         print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
+        return False
 
 
 def sync_cached_users_to_db() -> None:
@@ -888,10 +929,20 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
     return parsed_records
 
 
+# (device_serial, pin) -> (name, role, card) last stored successfully in
+# biometric_device_users by this process. Empty after a restart, so each user
+# is written once again and then skipped until the reader reports a change.
+_PERSISTED_DEVICE_USERS: dict[tuple[str, str], tuple[str, str, str]] = {}
+
+
 def parse_userinfo(body_str: str, sn: str):
-    """Parse pushed user info / name tables from eSSL / ZKTeco hardware."""
+    """Parse pushed user info / name tables from eSSL / ZKTeco hardware.
+
+    Returns how many valid user records the payload held, changed or not.
+    """
     if not body_str:
         return 0
+    received = 0
     updated = 0
     for line in body_str.replace("\r", "\n").split("\n"):
         line = line.strip()
@@ -956,25 +1007,34 @@ def parse_userinfo(body_str: str, sn: str):
                         pass
 
         if pin and name:
+            received += 1
+            clean_sn = str(sn).strip().upper()
+            record = (name, role, card)
+            # A full USERINFO answer repeats every user on the reader. Only a
+            # new or changed one is worth a DB upsert and punch back-fill —
+            # otherwise 100 users x 20 readers is thousands of writes per pull.
+            if _PERSISTED_DEVICE_USERS.get((clean_sn, pin)) == record:
+                continue
             DEVICE_USER_CACHE[pin] = {
                 "name": name,
                 "role": role,
-                "deviceSerial": str(sn).strip().upper(),
+                "deviceSerial": clean_sn,
                 "privilege": privilege,
                 "card": card,
             }
-            save_device_user_db(sn, pin, name, role)
+            if save_device_user_db(sn, pin, name, role, card or None):
+                _PERSISTED_DEVICE_USERS[(clean_sn, pin)] = record
             # Update any existing logs in memory that were waiting for this name
             for p in PUNCH_LOGS:
-                if str(p.get("userId", "")).strip() == pin:
+                if str(p.get("userId", "")).strip() == pin and str(p.get("sn", "")).upper() == clean_sn:
                     p["userName"] = name
                     p["userRole"] = role
             updated += 1
 
     if updated > 0:
         save_user_cache()
-        print(f"\033[1;32m[Push User Names Captured]\033[0m Learned {updated} user name(s) directly from machine {sn}!")
-    return updated
+        print(f"\033[1;32m[Push User Names Captured]\033[0m Learned {updated} new or changed user name(s) from machine {sn}")
+    return received
 
 
 def parse_oplog(body_str: str, sn: str):
@@ -982,6 +1042,7 @@ def parse_oplog(body_str: str, sn: str):
     if not body_str:
         return 0
     discovered = 0
+    unresolved_pins: set[str] = set()
     lines = [line.strip() for line in body_str.replace("\r", "\n").split("\n") if line.strip()]
     for line in lines:
         if is_header_or_metadata_line(line):
@@ -1010,8 +1071,8 @@ def parse_oplog(body_str: str, sn: str):
             rest = re.sub(r"\bTMP=\S+", "TMP=<omitted>", rest, flags=re.IGNORECASE)
             rest = rest.replace("\t", " | ")
             user_info = get_user_info(operator_pin, sn)
-            if user_info.get("name", "").startswith("User ") or not user_info.get("name"):
-                queue_targeted_userinfo_refresh(sn, operator_pin)
+            if _is_placeholder_name(user_info.get("name")):
+                unresolved_pins.add(operator_pin)
             op_name = user_info.get("name", f"User {operator_pin}")
             print(f"\033[1;35m[iClock Biometric Enrollment]\033[0m Device: {sn} | User: {op_name} (PIN: {operator_pin}) "
                   f"| Type: {modality} | {rest}")
@@ -1023,12 +1084,24 @@ def parse_oplog(body_str: str, sn: str):
             op_type = parts[1]
             op_time = parts[2]
             user_info = get_user_info(operator_pin, sn)
-            if user_info.get("name", "").startswith("Admin ") or user_info.get("name", "").startswith("User ") or not user_info.get("name"):
-                queue_targeted_userinfo_refresh(sn, operator_pin)
+            # PIN 0 is the reader's own menu with no admin enrolled, not a user.
+            if operator_pin not in ("", "0") and _is_placeholder_name(user_info.get("name")):
+                unresolved_pins.add(operator_pin)
             op_name = user_info.get("name", f"Admin {operator_pin}")
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Admin: {op_name} (ID: {operator_pin}) | OpType: {op_type} | Time: {op_time}")
         else:
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Raw: {line}")
+
+    # A USER record later in this same payload may already have named a PIN
+    # that an earlier FP line looked up blind.
+    clean_sn = str(sn or "").strip().upper()
+    unresolved_pins = {
+        pin for pin in unresolved_pins
+        if _is_placeholder_name((DEVICE_USER_CACHE.get(pin) or {}).get("name"))
+        or (DEVICE_USER_CACHE.get(pin) or {}).get("deviceSerial") not in (None, clean_sn)
+    }
+    if unresolved_pins:
+        request_userinfo_refresh(sn, unresolved_pins)
     return discovered
 
 
@@ -1560,11 +1633,12 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
 
     # Route by Table Type
     if "OPERLOG" in effective_table or "OPLOG" in effective_table:
+        # parse_oplog asks for a user refresh itself, and only for PINs it could
+        # not name. Re-querying whenever a payload held no USER rows looped:
+        # the reader answers in two posts, users then fingerprints, and the
+        # fingerprint post always "discovered" nobody.
         discovered = parse_oplog(body_str, sn)
         record_import_users(sn, discovered)
-        # Any admin action on device (adding user, finger, card, etc.) -> query userinfo to learn real names
-        if not discovered:
-            queue_device_cmd(sn, "DATA QUERY USERINFO")
         return PlainTextResponse(content="OK", media_type="text/plain")
 
     if "USERINFO" in effective_table or "USER" in effective_table:
@@ -1574,18 +1648,14 @@ async def cdata_handler(request: Request) -> PlainTextResponse:
     # Process Attendance / Realtime punches (ATTLOG, RTLOG, RECORD, or default)
     new_punches = parse_attlog(body_str, sn)
     if new_punches:
+        # parse_attlog already resolved each punch's name for this device.
         unresolved_pins = {
             str(p.get("userId", "")).strip()
             for p in new_punches
-            if str(p.get("userId", "")).strip() not in DEVICE_USER_CACHE
-            or DEVICE_USER_CACHE[str(p.get("userId", "")).strip()].get("name", "").startswith("User ")
+            if _is_placeholder_name(p.get("userName"))
         }
         if unresolved_pins:
-            # Bulk query first (cheap, works on firmware that supports it), then
-            # a per-PIN query for each one — some devices only answer that form.
-            queue_device_cmd(sn, "DATA QUERY USERINFO")
-            for pin in unresolved_pins:
-                queue_targeted_userinfo_refresh(sn, pin)
+            request_userinfo_refresh(sn, unresolved_pins)
 
         for punch in new_punches:
             print(format_punch_banner(punch, client_ip))

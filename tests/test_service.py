@@ -236,6 +236,100 @@ def test_db_name_lookup_keeps_card_and_never_borrows_another_branch(monkeypatch)
 
 
 # ----------------------------------------------------------------------
+# User refreshes must not loop: 100 users x 20 readers re-pulled every few
+# seconds is megabytes of fingerprint templates and thousands of DB writes.
+# ----------------------------------------------------------------------
+
+def _isolate_adms_state(monkeypatch, db_saves: list | None = None) -> None:
+    """Fresh command/refresh state, and no files, database or clock surprises."""
+    from app.sync import lms_db
+
+    def _no_database(self):
+        raise lms_db.LmsUnavailableError("no database in this test")
+
+    monkeypatch.setattr(lms_db.LmsDatabase, "_connection", _no_database)
+    monkeypatch.setattr(iclock, "COMMAND_TRACKING", {})
+    monkeypatch.setattr(iclock, "DEVICE_COMMAND_QUEUE", {})
+    monkeypatch.setattr(iclock, "_LAST_USERINFO_REFRESH", {})
+    monkeypatch.setattr(iclock, "_USERINFO_ASKED_FOR", {})
+    monkeypatch.setattr(iclock, "_PERSISTED_DEVICE_USERS", {})
+    monkeypatch.setattr(iclock, "DEVICE_USER_CACHE", {})
+    monkeypatch.setattr(iclock, "save_adms_state", lambda: None)
+    monkeypatch.setattr(iclock, "save_user_cache", lambda: None)
+    monkeypatch.setattr(iclock, "save_device_registry", lambda: None)
+
+    def _save(*args, **kwargs):
+        if db_saves is not None:
+            db_saves.append(args[:3])
+        return True
+
+    monkeypatch.setattr(iclock, "save_device_user_db", _save)
+
+
+def _userinfo_queries(sn: str) -> list[str]:
+    return [cmd for cmd in iclock.DEVICE_COMMAND_QUEUE.get(sn, []) if "DATA QUERY USERINFO" in cmd]
+
+
+def test_userinfo_answer_in_two_posts_does_not_requery(monkeypatch) -> None:
+    """The exact production loop: users arrive in one post, fingerprints in the
+    next. The fingerprint post names no users, which used to trigger another
+    DATA QUERY USERINFO — forever."""
+    _isolate_adms_state(monkeypatch)
+    sn = "LOOPTEST01"
+
+    users_post = "USER PIN=1\tName=Admin\tPri=14\tCard=\tGrp=1\nUSER PIN=2\tName=Deepak\tPri=14\tCard=\tGrp=1"
+    fingerprints_post = "FP PIN=1\tFID=6\tSize=1116\tValid=1\tTMP=AAAA\nFP PIN=2\tFID=6\tSize=1100\tValid=1\tTMP=BBBB"
+
+    for body in (users_post, fingerprints_post):
+        response = client.post(f"/iclock/cdata?SN={sn}&table=OPERLOG&Stamp=9999", content=body)
+        assert response.text == "OK"
+
+    assert _userinfo_queries(sn) == []
+
+
+def test_unchanged_users_are_not_rewritten_to_the_database(monkeypatch) -> None:
+    db_saves: list = []
+    _isolate_adms_state(monkeypatch, db_saves)
+    body = "USER PIN=1\tName=Admin\tPri=14\nUSER PIN=2\tName=Deepak\tPri=0"
+
+    assert iclock.parse_userinfo(body, "NFZ8254900401") == 2
+    assert len(db_saves) == 2
+
+    # The same answer again — the reader re-sends its whole table each time.
+    assert iclock.parse_userinfo(body, "NFZ8254900401") == 2
+    assert len(db_saves) == 2
+
+    # A renamed user is written, and only that one.
+    iclock.parse_userinfo("USER PIN=2\tName=Deepak Kumar\tPri=0", "NFZ8254900401")
+    assert db_saves[-1] == ("NFZ8254900401", "2", "Deepak Kumar")
+    assert len(db_saves) == 3
+
+
+def test_unknown_pin_refresh_is_rate_limited(monkeypatch) -> None:
+    _isolate_adms_state(monkeypatch)
+    sn = "RATELIMIT01"
+    clock = [1_000_000.0]
+    monkeypatch.setattr(iclock.time, "time", lambda: clock[0])
+
+    assert iclock.request_userinfo_refresh(sn, ["9"]) is True
+    # Still queued: no second copy, even for a different unknown PIN.
+    assert iclock.request_userinfo_refresh(sn, ["10"]) is False
+    assert len(_userinfo_queries(sn)) == 1
+
+    # Answered, but within the device cooldown.
+    for cmd in iclock.COMMAND_TRACKING.values():
+        cmd["status"] = "acknowledged"
+    clock[0] += 60
+    assert iclock.request_userinfo_refresh(sn, ["10"]) is False
+
+    # Past the cooldown: a PIN already asked about (the reader has no name
+    # for it) is not worth another full pull, but a new unknown PIN is.
+    clock[0] += iclock.USERINFO_DEVICE_COOLDOWN_SECONDS
+    assert iclock.request_userinfo_refresh(sn, ["9"]) is False
+    assert iclock.request_userinfo_refresh(sn, ["10"]) is True
+
+
+# ----------------------------------------------------------------------
 # The ADMS endpoints
 # ----------------------------------------------------------------------
 

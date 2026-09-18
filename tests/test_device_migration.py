@@ -53,8 +53,12 @@ def test_adms_device_probe_succeeds_when_reverse_tcp_is_unreachable(monkeypatch)
     assert res["directTcp"] is False
 
 
-def test_fetch_device_users():
+def test_fetch_device_users(monkeypatch, tmp_path):
     """Listing users returns accurate counts of users and enrolled fingers with real names."""
+    # Simulated names fall back to user_names.json; a developer's real one
+    # (renamed users on a live reader) must not decide whether this passes.
+    import app.core.device_migration as device_migration
+    monkeypatch.setattr(device_migration, "USER_NAMES_FILE", str(tmp_path / "user_names.json"))
     res = fetch_device_users("192.168.1.209", 4370, simulate=True)
     assert res["ok"] is True
     assert res["count"] == 3
