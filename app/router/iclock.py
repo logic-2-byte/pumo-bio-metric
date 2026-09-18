@@ -495,7 +495,15 @@ def get_user_info(user_id: str, device_serial: str | None = None) -> dict:
             row = cur.fetchone()
             _LAST_DB_ERROR = None
             if row and row[0]:
-                info = {"name": row[0].strip(), "role": row[1] or "Normal User", "deviceSerial": clean_sn}
+                # Merge rather than replace: USERINFO may have just cached this
+                # PIN's card and privilege, which the DB row does not carry.
+                # Only merge an entry from this same device (or an untagged
+                # legacy one) — never carry another branch's card over.
+                existing = DEVICE_USER_CACHE.get(u_id) or {}
+                if existing.get("deviceSerial") not in (None, clean_sn):
+                    existing = {}
+                info = {**existing, "name": row[0].strip(), "role": row[1] or "Normal User",
+                        "deviceSerial": clean_sn}
                 DEVICE_USER_CACHE[u_id] = info
                 save_user_cache()
                 _UNRESOLVED_NAME_WARNED.discard((clean_sn, u_id))
@@ -650,6 +658,22 @@ def save_device_user_db(sn: str, pin: str, name: str, role: str = "Normal User",
 
     except Exception as exc:
         print(f"\033[1;33m[DB Sync Warning]\033[0m Could not save user {pin} to DB: {exc}", flush=True)
+
+
+def sync_cached_users_to_db() -> None:
+    """Seed biometric_device_users table from local user cache on startup."""
+    try:
+        from app.sync.config import config
+        if not config.configured:
+            return
+        for pin, info in DEVICE_USER_CACHE.items():
+            name = info.get("name")
+            if name and not name.startswith("User "):
+                role = info.get("role", "Normal User")
+                sn = info.get("deviceSerial", "NFZ8254900401")
+                save_device_user_db(sn, pin, name, role, str(info.get("card") or ""))
+    except Exception:
+        pass
 
 
 def format_punch_banner(punch: dict, client_ip: str = "") -> str:
@@ -889,7 +913,13 @@ def parse_userinfo(body_str: str, sn: str):
             for item in fields:
                 if "=" in item:
                     k, v = item.split("=", 1)
-                    kv[k.strip().upper()] = v.strip().strip('"')
+                    # OPERLOG records lead with their record type, so the first
+                    # tab field is "USER PIN=3", not "PIN=3". Keyed as-is it
+                    # became "USER PIN", the PIN lookup below missed, and every
+                    # name the reader sent was silently dropped.
+                    key_words = k.split()
+                    if key_words:
+                        kv[key_words[-1].upper()] = v.strip().strip('"')
             # Some eSSL devices wrap USERINFO inside OPERLOG and use spaces
             # rather than tabs. Preserve a multi-word Name until the next key.
             if "\t" not in line:
@@ -980,6 +1010,8 @@ def parse_oplog(body_str: str, sn: str):
             rest = re.sub(r"\bTMP=\S+", "TMP=<omitted>", rest, flags=re.IGNORECASE)
             rest = rest.replace("\t", " | ")
             user_info = get_user_info(operator_pin, sn)
+            if user_info.get("name", "").startswith("User ") or not user_info.get("name"):
+                queue_targeted_userinfo_refresh(sn, operator_pin)
             op_name = user_info.get("name", f"User {operator_pin}")
             print(f"\033[1;35m[iClock Biometric Enrollment]\033[0m Device: {sn} | User: {op_name} (PIN: {operator_pin}) "
                   f"| Type: {modality} | {rest}")
@@ -991,6 +1023,8 @@ def parse_oplog(body_str: str, sn: str):
             op_type = parts[1]
             op_time = parts[2]
             user_info = get_user_info(operator_pin, sn)
+            if user_info.get("name", "").startswith("Admin ") or user_info.get("name", "").startswith("User ") or not user_info.get("name"):
+                queue_targeted_userinfo_refresh(sn, operator_pin)
             op_name = user_info.get("name", f"Admin {operator_pin}")
             print(f"\033[1;35m[iClock Admin Action]\033[0m Device: {sn} | Admin: {op_name} (ID: {operator_pin}) | OpType: {op_type} | Time: {op_time}")
         else:

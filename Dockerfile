@@ -20,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # database passwords end up in a registry.
 COPY app/ ./app
 COPY gunicorn_config.py .
+COPY user_names.json* device_registry.json* ./
 
 # Where punches are held when the LMS cannot be reached, and where logs rotate.
 #

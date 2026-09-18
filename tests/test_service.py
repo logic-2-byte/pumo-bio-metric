@@ -152,6 +152,89 @@ def test_operlog_user_profile_is_saved_as_adms_user(monkeypatch) -> None:
     assert iclock.DEVICE_USER_CACHE["007"]["deviceSerial"] == "ZK1"
 
 
+def test_operlog_tab_separated_user_record_with_type_prefix(monkeypatch) -> None:
+    """The shape NFZ firmware actually sends: record-type prefix AND tabs.
+
+    "USER PIN=3" is one tab field, so its key parsed as "USER PIN" rather than
+    "PIN" and every name the reader sent was dropped. The tests above each
+    cover only half of this shape, which is how it went unnoticed.
+    """
+    monkeypatch.setattr(iclock, "save_device_user_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(iclock, "save_user_cache", lambda: None)
+
+    # The FP line triggers a name lookup that reads Postgres; keep this test
+    # independent of whatever a developer's local database happens to hold.
+    from app.sync import lms_db
+
+    def _no_database(self):
+        raise lms_db.LmsUnavailableError("no database in this test")
+
+    monkeypatch.setattr(lms_db.LmsDatabase, "_connection", _no_database)
+    for pin in ("3", "009"):
+        iclock.DEVICE_USER_CACHE.pop(pin, None)
+
+    body = "\n".join([
+        "USER PIN=3\tName=Aki\tPri=0\tPasswd=\tCard=12345\tGrp=1\tTZ=0000000000000000",
+        "FP PIN=3\tFID=6\tSize=1448\tValid=1\tTMP=AAAA",
+        "USER PIN=009\tName=Deepak Kumar\tPri=14\tPasswd=\tCard=\tGrp=1",
+    ])
+    discovered = iclock.parse_oplog(body, "NFZ8254900401")
+
+    assert discovered == 2
+    assert iclock.DEVICE_USER_CACHE["3"]["name"] == "Aki"
+    assert iclock.DEVICE_USER_CACHE["3"]["card"] == "12345"
+    assert iclock.DEVICE_USER_CACHE["009"]["name"] == "Deepak Kumar"
+    assert iclock.DEVICE_USER_CACHE["009"]["role"] == "Super Admin"
+    assert iclock.DEVICE_USER_CACHE["009"]["deviceSerial"] == "NFZ8254900401"
+
+
+def test_db_name_lookup_keeps_card_and_never_borrows_another_branch(monkeypatch) -> None:
+    """A DB-resolved name must not wipe the card USERINFO just cached for this
+    device — and must never inherit another branch's card for the same PIN."""
+    from contextlib import contextmanager
+
+    from app.sync import lms_db
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *args, **kwargs):
+            pass
+
+        def fetchone(self):
+            return ("Aki", "Normal User")
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    @contextmanager
+    def _fake_connection(self):
+        yield _Conn()
+
+    monkeypatch.setattr(lms_db.LmsDatabase, "_connection", _fake_connection)
+    monkeypatch.setattr(iclock, "save_user_cache", lambda: None)
+
+    monkeypatch.setitem(iclock.DEVICE_USER_CACHE, "3", {
+        "name": "Aki", "role": "Normal User", "deviceSerial": "NFZ8254900401",
+        "privilege": 0, "card": "12345",
+    })
+    info = iclock.get_user_info("3", "NFZ8254900401")
+    assert info["name"] == "Aki"
+    assert info["card"] == "12345"
+
+    monkeypatch.setitem(iclock.DEVICE_USER_CACHE, "3", {
+        "name": "Someone Else", "deviceSerial": "OTHERBRANCH01", "card": "99999",
+    })
+    info = iclock.get_user_info("3", "NFZ8254900401")
+    assert info["name"] == "Aki"
+    assert "card" not in info
+
+
 # ----------------------------------------------------------------------
 # The ADMS endpoints
 # ----------------------------------------------------------------------

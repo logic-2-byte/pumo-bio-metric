@@ -54,6 +54,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[Any]:
     print("=" * 66 + "\n")
 
     supervisor.start()
+    if sync_config.configured:
+        with suppress(Exception):
+            from app.router.iclock import sync_cached_users_to_db
+            sync_cached_users_to_db()
 
     yield
 
