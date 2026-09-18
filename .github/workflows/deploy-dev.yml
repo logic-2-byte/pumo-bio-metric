@@ -70,6 +70,17 @@ jobs:
             echo "$ENV_CONTENT" | sed -E 's/ ([A-Za-z0-9_]+=)/\n\1/g' > .env
             chmod 600 .env
 
+            # An empty or partial .env still starts a container that answers
+            # /api/pulse, so the health check below would go green on a bridge
+            # that cannot reach the database. Stop before replacing the
+            # running container instead.
+            for key in LMS_DB_HOST LMS_DB_NAME LMS_DB_USER; do
+              if ! grep -q "^${key}=." .env; then
+                echo "::error::${key} is missing from .env. Set the ENV_TEST variable in the 'env_test' GitHub environment (the one this job runs in)."
+                exit 1
+              fi
+            done
+
             # The two bind-mounted directories, created with 10001:10001 permissions
             mkdir -p spool data/logs
             sudo chown -R 10001:10001 spool data/logs 2>/dev/null \
