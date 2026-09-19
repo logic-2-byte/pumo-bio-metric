@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # guaranteed multi-second dead end on every create/delete call.
     device_transport_mode: str = "hybrid"
 
+    # The business day's timezone — see app.core.clock. Must match the LMS's
+    # APP_ATTENDANCE_ZONE. Never the host's zone: the server runs in the US.
+    business_timezone: str = "Asia/Kolkata"
+
     @field_validator("debug", mode="before")
     @classmethod
     def parse_debug(cls, v: Any) -> bool:

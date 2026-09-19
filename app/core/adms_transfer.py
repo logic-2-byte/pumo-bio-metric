@@ -22,6 +22,7 @@ import threading
 import uuid
 from datetime import datetime
 from typing import Any
+from app.core import clock
 
 TRANSFER_JOBS: dict[str, dict[str, Any]] = {}
 _lock = threading.Lock()
@@ -38,7 +39,7 @@ def _command_id(cmd_str: str) -> str:
 
 
 def _now() -> str:
-    return datetime.now().isoformat()
+    return clock.now().isoformat()
 
 
 def _waiting_jobs(sn: str, pin: str) -> list[dict[str, Any]]:

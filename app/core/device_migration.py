@@ -35,6 +35,7 @@ except ImportError:
 
 import json
 import os
+from app.core import clock
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 DEVICE_REGISTRY_FILE = os.path.join(BASE_DIR, "device_registry.json")
@@ -436,7 +437,7 @@ def probe_device_connection(device_id: str, port: int = 4370, timeout: int = 5, 
                     "fingerCount": None,
                     "fpVersion": "ADMS",
                     "platform": "ADMS Push",
-                    "lastSeen": datetime.fromtimestamp(seen_at).isoformat(),
+                    "lastSeen": clock.from_timestamp(seen_at).isoformat(),
                     "message": (
                         "Device is online through ADMS push; direct TCP port 4370 "
                         "is not reachable from this server. Use queued ADMS commands "

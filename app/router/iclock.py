@@ -12,6 +12,8 @@ from urllib.parse import parse_qs
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
+from app.core import clock
+
 router = APIRouter(tags=["iclock"])
 
 # -----------------------------------------------------------------------------
@@ -71,7 +73,7 @@ def queue_device_cmd(sn: str, cmd_body: str, *, job_id: str | None = None,
         "sn": clean_sn, "command": redact_command(clean_cmd), "jobId": job_id,
         "action": action or ("mutation" if is_mutation else "command"),
         "status": "queued",
-        "queuedAt": datetime.now().isoformat(),
+        "queuedAt": clock.now().isoformat(),
     }
     save_adms_state()
     pos = queue.index(cmd_str) + 1
@@ -228,13 +230,13 @@ def start_adms_onboarding(sn: str, *, days: int = 30) -> dict:
         if latest.get("status") != "failed":
             return latest
 
-    end_at = datetime.now().replace(microsecond=0)
+    end_at = clock.wall_now().replace(microsecond=0)  # the reader's clock
     start_at = end_at - timedelta(days=days)
     job_id = f"{clean_sn}-{end_at.strftime('%Y%m%d%H%M%S')}"
     job = {
         "id": job_id, "sn": clean_sn, "status": "queued", "days": days,
         "startTime": start_at.isoformat(), "endTime": end_at.isoformat(),
-        "createdAt": datetime.now().isoformat(), "usersReceived": 0,
+        "createdAt": clock.now().isoformat(), "usersReceived": 0,
         "punchesReceived": 0, "punchesStored": 0, "duplicates": 0,
         "commands": [], "errors": [],
     }
@@ -282,7 +284,7 @@ def record_command_result(sn: str | None, body: str) -> None:
         result = (parsed.get("Return") or [""])[0]
         tracked["status"] = "acknowledged" if result == "0" else "failed"
         tracked["returnCode"] = result
-        tracked["acknowledgedAt"] = datetime.now().isoformat()
+        tracked["acknowledgedAt"] = clock.now().isoformat()
         job = ADMS_IMPORT_JOBS.get(tracked.get("jobId") or "")
         if job is not None:
             if result != "0":
@@ -290,7 +292,7 @@ def record_command_result(sn: str | None, body: str) -> None:
                 job["errors"].append(f"{tracked.get('action')} command returned {result or 'no code'}")
             elif tracked.get("action") == "attlog":
                 job["status"] = "completed"
-                job["completedAt"] = datetime.now().isoformat()
+                job["completedAt"] = clock.now().isoformat()
             else:
                 job["status"] = "receiving"
         save_adms_state()
@@ -326,7 +328,7 @@ def _log_timestamp(punch: dict) -> datetime | None:
 
 def prune_punch_logs(days: int = HISTORY_DAYS) -> None:
     """Keep the complete requested history window instead of an arbitrary row count."""
-    cutoff = datetime.now() - timedelta(days=max(1, days))
+    cutoff = clock.wall_now() - timedelta(days=max(1, days))
     PUNCH_LOGS[:] = [
         punch for punch in PUNCH_LOGS
         if (when := _log_timestamp(punch)) is None or when >= cutoff
@@ -428,12 +430,12 @@ def mark_seen(sn: str | None, request: Request | None = None, *, force: bool = F
                 "ip": client_ip or "127.0.0.1",
                 "port": 4370,
                 "name": f"eSSL Reader ({clean_sn})",
-                "lastSeen": datetime.now().isoformat()
+                "lastSeen": clock.now().isoformat()
             }
         else:
             if client_ip:
                 DEVICE_REGISTRY[clean_sn]["ip"] = client_ip
-            DEVICE_REGISTRY[clean_sn]["lastSeen"] = datetime.now().isoformat()
+            DEVICE_REGISTRY[clean_sn]["lastSeen"] = clock.now().isoformat()
         save_device_registry()
 
     # Imported here rather than at module import so this router still loads on
@@ -559,7 +561,7 @@ def get_user_info(user_id: str, device_serial: str | None = None) -> dict:
                 _UNRESOLVED_NAME_WARNED.discard((clean_sn, u_id))
                 return info
     except Exception as exc:
-        _LAST_DB_ERROR = {"message": str(exc).strip(), "at": datetime.now().isoformat()}
+        _LAST_DB_ERROR = {"message": str(exc).strip(), "at": clock.now().isoformat()}
         if (clean_sn, u_id) not in _UNRESOLVED_NAME_WARNED:
             print(f"\033[1;31m[User Lookup]\033[0m biometric_device_users query failed for PIN {u_id}: {exc}")
 
@@ -856,7 +858,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
                     "verifyType": str(kv_dict.get("VERIFY", kv_dict.get("VERIFYTYPE", "1"))),
                     "workCode": str(kv_dict.get("WORKCODE", "0")),
                     "raw": line,
-                    "receivedAt": datetime.now().isoformat()
+                    "receivedAt": clock.now().isoformat()
                 })
                 continue
 
@@ -884,7 +886,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
                 "verifyType": str(verify_val),
                 "workCode": str(work_val),
                 "raw": line,
-                "receivedAt": datetime.now().isoformat()
+                "receivedAt": clock.now().isoformat()
             })
             continue
 
@@ -909,7 +911,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
                 "verifyType": str(verify_val),
                 "workCode": str(work_val),
                 "raw": line,
-                "receivedAt": datetime.now().isoformat()
+                "receivedAt": clock.now().isoformat()
             })
             continue
 
@@ -929,7 +931,7 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
                 "verifyType": str(comma_parts[3] if len(comma_parts) > 3 else "1"),
                 "workCode": str(comma_parts[4] if len(comma_parts) > 4 else "0"),
                 "raw": line,
-                "receivedAt": datetime.now().isoformat()
+                "receivedAt": clock.now().isoformat()
             })
             continue
 
@@ -942,12 +944,12 @@ def parse_attlog(body_str: str, sn: str) -> list[dict]:
             "userId": pin,
             "userName": user_info.get("name", f"User {pin}"),
             "userRole": user_info.get("role", "Normal User"),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": clock.wall_now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": "0",
             "verifyType": "1",
             "workCode": "0",
             "raw": line,
-            "receivedAt": datetime.now().isoformat()
+            "receivedAt": clock.now().isoformat()
         })
 
     return parsed_records
@@ -1155,7 +1157,7 @@ def get_query_param_ci(request: Request, key: str, default: str | None = None) -
 async def get_punches(days: int = HISTORY_DAYS):
     """Return the complete local attendance history for the requested window."""
     window = min(max(days, 1), HISTORY_DAYS)
-    cutoff = datetime.now() - timedelta(days=window)
+    cutoff = clock.wall_now() - timedelta(days=window)
     rows = [p for p in PUNCH_LOGS if (when := _log_timestamp(p)) is None or when >= cutoff]
     return {"count": len(rows), "days": window, "data": rows}
 
@@ -1321,7 +1323,7 @@ async def sync_device_punches(request: Request) -> JSONResponse:
                 "serialNumber": sn,
                 "ip": target_ip,
                 "port": port,
-                "lastSeen": datetime.fromtimestamp(seen_at).isoformat(),
+                "lastSeen": clock.from_timestamp(seen_at).isoformat(),
                 "message": (
                     "Device is online through ADMS push. Attendance and queued "
                     "commands sync when the device polls the server; direct TCP "
@@ -1387,7 +1389,7 @@ async def sync_device_punches(request: Request) -> JSONResponse:
             "verifyType": str(r.punch if r.punch is not None else 1),
             "workCode": "0",
             "raw": f"{uid_str}\t{ts_str}\t{r.status}\t{r.punch}\t0",
-            "receivedAt": datetime.now().isoformat(),
+            "receivedAt": clock.now().isoformat(),
             "statusLabel": PUNCH_STATUS_MAP.get(str(r.status), "Check-In"),
             "verifyLabel": VERIFY_MODES.get(str(r.punch if r.punch is not None else 1), "Fingerprint")
         }
@@ -1522,7 +1524,7 @@ async def get_device_status(sn: str):
     is_online = diff < ADMS_ONLINE_WINDOW_SECONDS
     return {
         "status": "online" if is_online else "offline",
-        "last_seen": datetime.fromtimestamp(last_seen_time).isoformat(),
+        "last_seen": clock.from_timestamp(last_seen_time).isoformat(),
         "sn": sn,
         "seconds_since_last_seen": diff
     }
@@ -1755,7 +1757,7 @@ async def getrequest_handler(request: Request) -> PlainTextResponse:
         command_id = cmd.split(":", 2)[1] if cmd.count(":") >= 2 else ""
         if command_id in COMMAND_TRACKING:
             COMMAND_TRACKING[command_id]["status"] = "dispatched"
-            COMMAND_TRACKING[command_id]["dispatchedAt"] = datetime.now().isoformat()
+            COMMAND_TRACKING[command_id]["dispatchedAt"] = clock.now().isoformat()
         save_adms_state()
         from app.core.adms_transfer import redact_command
         print(f"\033[1;32m[Push Command Dispatched]\033[0m Machine: {clean_sn} -> {redact_command(cmd)}")
